@@ -218,6 +218,432 @@ system_menu() {
 # ============================================================
 # 模块：系统安全
 # ============================================================
+
+# ---------- SSH 辅助函数 ----------
+
+BACKUP_DIR="/etc/linux-helper/backups"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
+LH_SSH_DROPIN="$SSHD_CONFIG_DIR/99-linux-helper.conf"
+
+# 获取 SSH 监听的所有端口（从运行进程中提取）
+ssh_current_ports() {
+    ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | sed 's/.*://' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+# 查找某个 SSH 配置项出现在哪些文件中
+ssh_find_setting() {
+    local key="$1"
+    local found=()
+    # 检查主配置文件
+    if grep -qE "^\s*${key}\s+" "$SSHD_CONFIG" 2>/dev/null; then
+        found+=("$SSHD_CONFIG")
+    fi
+    # 检查所有 drop-in 文件（按字母序，越晚优先级越高）
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        for f in "$SSHD_CONFIG_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            if grep -qE "^\s*${key}\s+" "$f" 2>/dev/null; then
+                found+=("$f")
+            fi
+        done
+    fi
+    printf '%s\n' "${found[@]}"
+}
+
+# 获取某个 SSH 配置项的实际生效值
+ssh_get_setting() {
+    local key="$1"
+    # 从后往前查找，最后一个匹配即为生效值
+    local val=""
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        for f in "$SSHD_CONFIG_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            val=$(grep -E "^\s*${key}\s+" "$f" 2>/dev/null | tail -1 | awk '{print $2}')
+            [[ -n "$val" ]] && last_val="$val"
+        done
+    fi
+    val=$(grep -E "^\s*${key}\s+" "$SSHD_CONFIG" 2>/dev/null | tail -1 | awk '{print $2}')
+    [[ -n "$val" ]] && last_val="$val"
+    echo "${last_val:-}"
+}
+
+# 备份所有 SSH 配置文件
+ssh_backup_all() {
+    mkdir -p "$BACKUP_DIR"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    local backup_dir="$BACKUP_DIR/ssh-backup-$ts"
+    mkdir -p "$backup_dir"
+
+    cp "$SSHD_CONFIG" "$backup_dir/sshd_config" 2>/dev/null || true
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        cp -r "$SSHD_CONFIG_DIR" "$backup_dir/sshd_config.d" 2>/dev/null || true
+    fi
+    info "SSH 配置已备份到: $backup_dir"
+    echo "$backup_dir"
+}
+
+# 安全重启 SSH（带超时回滚）
+ssh_safe_restart() {
+    info "正在检查 SSH 配置语法..."
+    if sshd -t 2>&1; then
+        info "配置语法正确，重启 SSH 服务..."
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || {
+            warn "SSH 重启失败，请手动检查"
+            return 1
+        }
+        success "SSH 服务已重启"
+    else
+        error "SSH 配置语法错误！请检查配置。"
+        return 1
+    fi
+}
+
+# ---------- SSH 功能 ----------
+
+ssh_change_port() {
+    echo ""
+    header "修改 SSH 端口"
+
+    local current_ports
+    current_ports=$(ssh_current_ports)
+    info "当前 SSH 监听端口: ${current_ports:-未检测到}"
+
+    local new_port
+    read -p "输入新的 SSH 端口号 (1-65535): " new_port
+    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        warn "无效端口号，请输入 1-65535 之间的数字。"
+        return
+    fi
+
+    # 检查端口是否已被占用
+    if ss -tlnp 2>/dev/null | grep -q ":$new_port "; then
+        warn "端口 $new_port 已被占用"
+        confirm "仍然强制设置？" || return
+    fi
+
+    local backup_dir
+    backup_dir=$(ssh_backup_all)
+
+    # 1. 从所有文件（主配置 + drop-in）中删除所有 Port 行
+    info "清除所有文件中的 Port 配置..."
+    sed -i '/^\s*Port\s\+/d' "$SSHD_CONFIG"
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        for f in "$SSHD_CONFIG_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            if grep -qE '^\s*Port\s+' "$f" 2>/dev/null; then
+                sed -i '/^\s*Port\s\+/d' "$f"
+                info "  已清理: $f"
+            fi
+            # 如果文件变空则删除
+            if [[ ! -s "$f" ]] || ! grep -qE '\S' "$f" 2>/dev/null; then
+                rm -f "$f"
+                info "  已删除空白文件: $f"
+            fi
+        done
+    fi
+
+    # 2. 统一写入 99-linux-helper.conf
+    mkdir -p "$SSHD_CONFIG_DIR"
+    echo "Port ${new_port}" >> "$LH_SSH_DROPIN"
+    info "已写入: $LH_SSH_DROPIN -> Port ${new_port}"
+
+    echo ""
+    info "修改后检查配置..."
+    if sshd -t 2>&1; then
+        success "配置语法正确"
+        info "端口配置已写入: $(readlink -f "$LH_SSH_DROPIN")"
+        echo ""
+        warn "请确认以下事项后再重启 SSH:"
+        echo "  1. 防火墙已放行端口 $new_port"
+        echo "  2. 如果你通过 SSH 连接，新端口会话不会中断"
+        echo ""
+        if confirm "立即重启 SSH 服务？"; then
+            if command -v ufw &>/dev/null && ufw status | grep -q active; then
+                info "检测到 UFW 防火墙，自动放行端口 $new_port ..."
+                ufw allow "$new_port"/tcp 2>/dev/null || true
+            fi
+            if command -v firewall-cmd &>/dev/null; then
+                info "检测到 firewalld，自动放行端口 $new_port ..."
+                firewall-cmd --add-port="$new_port"/tcp --permanent 2>/dev/null || true
+                firewall-cmd --reload 2>/dev/null || true
+            fi
+            ssh_safe_restart
+            echo ""
+            info "新端口 $new_port 已生效"
+            info "如需用旧端口连接，请在 $(date -d '+5 minutes' '+%H:%M:%S') 前保持旧会话"
+        else
+            info "跳过重启，配置已保存。下次重启 SSH 后生效。"
+        fi
+    else
+        error "配置语法错误！恢复备份..."
+        cp "$backup_dir/sshd_config" "$SSHD_CONFIG" 2>/dev/null || true
+        if [[ -d "$backup_dir/sshd_config.d" ]]; then
+            rm -rf "$SSHD_CONFIG_DIR"
+            cp -r "$backup_dir/sshd_config.d" "$SSHD_CONFIG_DIR" 2>/dev/null || true
+        fi
+        warn "已恢复备份，配置未生效。"
+    fi
+}
+
+ssh_root_login() {
+    echo ""
+    header "配置 root 密码登录"
+
+    # 显示当前状态
+    local permit_root
+    local password_auth
+    permit_root=$(ssh_get_setting "PermitRootLogin")
+    password_auth=$(ssh_get_setting "PasswordAuthentication")
+
+    echo "  当前 PermitRootLogin:    ${permit_root:-未设置 (默认 prohibit-password)}"
+    echo "  当前 PasswordAuthentication: ${password_auth:-未设置 (默认 yes)}"
+    echo ""
+
+    # 检查是否已启用
+    if [[ "$permit_root" == "yes" ]] && [[ "$password_auth" != "no" ]]; then
+        success "root 密码登录已经是开启状态"
+        if confirm "重新设置？"; then
+            :
+        else
+            return
+        fi
+    fi
+
+    confirm "开启 root 密码登录？（将设置 PermitRootLogin yes 并确保密码认证开启）" || return
+
+    ssh_backup_all
+
+    # 第1步：从所有文件中删除 PermitRootLogin / PasswordAuthentication / ChallengeResponseAuthentication
+    for key in PermitRootLogin PasswordAuthentication ChallengeResponseAuthentication; do
+        sed -i "/^\s*${key}\s\+/d" "$SSHD_CONFIG"
+        if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+            for f in "$SSHD_CONFIG_DIR"/*.conf; do
+                [[ -f "$f" ]] || continue
+                if grep -qE "^\s*${key}\s+" "$f" 2>/dev/null; then
+                    sed -i "/^\s*${key}\s\+/d" "$f"
+                    info "  已清理 ${key}: $f"
+                fi
+                # 文件变空则删除
+                if [[ ! -s "$f" ]] || ! grep -qE '\S' "$f" 2>/dev/null; then
+                    rm -f "$f"
+                    info "  已删除空白文件: $f"
+                fi
+            done
+        fi
+    done
+
+    # 第2步：统一写入 99-linux-helper.conf
+    mkdir -p "$SSHD_CONFIG_DIR"
+    {
+        echo "PermitRootLogin yes"
+        echo "PasswordAuthentication yes"
+        echo "ChallengeResponseAuthentication yes"
+    } >> "$LH_SSH_DROPIN"
+    info "已写入: $LH_SSH_DROPIN"
+
+    echo ""
+    if sshd -t 2>&1; then
+        success "配置语法正确"
+        if confirm "立即重启 SSH 服务？"; then
+            ssh_safe_restart
+            echo ""
+            info "请在新终端中测试 root 密码登录后再关闭当前会话！"
+        fi
+    else
+        error "配置语法错误，请手动检查 /etc/ssh/sshd_config"
+    fi
+}
+
+ssh_manage_keys() {
+    while true; do
+        clear; header "SSH 公钥管理"
+
+        # 查找所有有 authorized_keys 的用户
+        local users=()
+        local key_files=()
+        while IFS=: read -r user _ uid _ _ home shell; do
+            [[ "$home" == /nonexistent || "$home" == / || -z "$home" ]] && continue
+            [[ "$shell" == /usr/sbin/nologin || "$shell" == /bin/false || "$shell" == /sbin/nologin ]] && continue
+            local ak="$home/.ssh/authorized_keys"
+            if [[ -f "$ak" ]]; then
+                users+=("$user")
+                key_files+=("$ak")
+            fi
+        done < /etc/passwd
+
+        if [[ ${#users[@]} -eq 0 ]]; then
+            info "系统中没有找到 authorized_keys 文件。"
+            read -p "按回车键返回..."
+            return
+        fi
+
+        echo "  选择用户查看其公钥:"
+        local i
+        for i in "${!users[@]}"; do
+            local count
+            count=$(wc -l < "${key_files[$i]}")
+            echo "  $((i+1))) ${users[$i]} (${count} 个密钥)"
+        done
+        echo ""
+        echo "  b) 返回上级"
+        echo "  q) 退出"
+        echo ""
+        read -p "  请选择用户: " user_choice
+
+        [[ "$user_choice" =~ ^[Bb]$ ]] && break
+        [[ "$user_choice" =~ ^[Qq]$ ]] && exit 0
+
+        local idx=$((user_choice - 1))
+        if [[ $idx -ge 0 && $idx -lt ${#users[@]} ]]; then
+            ssh_list_delete_keys "${users[$idx]}" "${key_files[$idx]}"
+        fi
+    done
+}
+
+ssh_list_delete_keys() {
+    local user="$1"
+    local key_file="$2"
+
+    while true; do
+        clear; header "用户 ${user} 的 SSH 公钥"
+
+        local keys=()
+        while IFS= read -r line; do
+            keys+=("$line")
+        done < "$key_file"
+
+        if [[ ${#keys[@]} -eq 0 ]]; then
+            info "该用户没有公钥。"
+            read -p "按回车键返回..."
+            return
+        fi
+
+        local i
+        for i in "${!keys[@]}"; do
+            local key_preview
+            key_preview=$(echo "${keys[$i]}" | awk '{print $1" "substr($3,1,40)}')
+            echo "  $((i+1))) ${key_preview:-空白行 $((i+1))}"
+        done
+        echo ""
+        echo "  输入编号删除对应密钥（可多选，如: 1 3 5）"
+        echo "  a) 删除全部密钥"
+        echo "  b) 返回上级"
+        echo "  q) 退出"
+        echo ""
+        read -p "  请选择: " del_choice
+
+        [[ "$del_choice" =~ ^[Bb]$ ]] && return
+        [[ "$del_choice" =~ ^[Qq]$ ]] && exit 0
+
+        if [[ "$del_choice" =~ ^[Aa]$ ]]; then
+            confirm "确认删除 ${user} 的所有 ${#keys[@]} 个密钥？" || continue
+            : > "$key_file"
+            success "已删除 ${user} 的全部密钥"
+            read -p "按回车键继续..."
+            return
+        fi
+
+        local to_delete=()
+        local nums
+        nums=($del_choice)
+        local n
+        for n in "${nums[@]}"; do
+            if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#keys[@]} )); then
+                to_delete+=("$n")
+            fi
+        done
+
+        if [[ ${#to_delete[@]} -eq 0 ]]; then
+            warn "无效选择"
+            read -p "按回车键继续..."
+            continue
+        fi
+
+        # 排序并去重（从大到小删除以免索引偏移）
+        IFS=$'\n' to_delete=($(printf "%s\n" "${to_delete[@]}" | sort -ru))
+        unset IFS
+
+        local tmpfile
+        tmpfile=$(mktemp)
+        cp "$key_file" "$tmpfile"
+
+        local count=0
+        local n
+        for n in "${to_delete[@]}"; do
+            local line_idx=$((n - 1))
+            local preview
+            preview=$(echo "${keys[$line_idx]}" | awk '{print substr($0,1,60)}')
+            warn "  删除: ${preview}..."
+            count=$((count + 1))
+        done
+
+        confirm "确认删除以上 ${count} 个密钥？" || {
+            rm -f "$tmpfile"
+            continue
+        }
+
+        # 重建文件：跳过被选中的行（用 awk 实现原子操作）
+        {
+            local del_idx=()
+            for n in "${to_delete[@]}"; do
+                del_idx+=("$n")
+            done
+            # 构建 awk 表达式: NR==n1 {next} NR==n2 {next} ... {print}
+            local awk_script=""
+            for n in "${del_idx[@]}"; do
+                awk_script="${awk_script}NR==${n}{next};"
+            done
+            awk_script="${awk_script}1"
+            awk "$awk_script" "$tmpfile" > "$key_file"
+        }
+
+        rm -f "$tmpfile"
+        success "已删除 ${count} 个密钥"
+
+        # 检查是否还有剩余密钥
+        local remaining
+        remaining=$(wc -l < "$key_file")
+        info "剩余 ${remaining} 个密钥"
+        read -p "按回车键继续..."
+    done
+}
+
+ssh_menu() {
+    while true; do
+        clear; header "SSH 安全配置"
+
+        local port display
+        port=$(ssh_get_setting "Port")
+        [[ -z "$port" ]] && port="22 (默认)"
+        local root_login
+        root_login=$(ssh_get_setting "PermitRootLogin")
+        [[ -z "$root_login" ]] && root_login="未设置"
+        local pw_auth
+        pw_auth=$(ssh_get_setting "PasswordAuthentication")
+        [[ -z "$pw_auth" ]] && pw_auth="未设置"
+
+        echo "  1) 修改 SSH 端口          (当前: ${port})"
+        echo "  2) 开启 root 密码登录     (PermitRootLogin: ${root_login})"
+        echo "  3) 管理 SSH 公钥          (查看/删除)"
+        echo ""
+        echo "  b) 返回主菜单"
+        echo "  q) 退出脚本"
+        echo ""
+        read -p "  请选择: " choice
+        case "$choice" in
+            1) ssh_change_port ;;
+            2) ssh_root_login ;;
+            3) ssh_manage_keys ;;
+            b|B) break ;;
+            q|Q) exit 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        read -p "按回车键继续..."
+    done
+}
+
 security_menu() {
     while true; do
         clear; header "系统安全"
@@ -227,7 +653,7 @@ security_menu() {
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
         read -p "  请选择: " choice
         case "$choice" in
-            1) placeholder "SSH 安全配置" ;;
+            1) ssh_menu ;;
             2) placeholder "配置防火墙" ;;
             3) placeholder "Fail2Ban 管理" ;;
             b|B) break ;;
