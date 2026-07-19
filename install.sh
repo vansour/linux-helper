@@ -667,6 +667,343 @@ security_menu() {
 # ============================================================
 # 模块：系统调优
 # ============================================================
+
+# ---------- Swap 管理 ----------
+
+swap_show_status() {
+    echo ""
+    header "当前 Swap 状态"
+    echo ""
+    if swapon --show 2>/dev/null; then
+        echo ""
+    else
+        info "未检测到任何 Swap 设备"
+    fi
+    echo -e "${BLUE}free -h${NC}:"
+    free -h | grep -E '^Swap|^Mem' || true
+    echo ""
+    # 显示 /etc/fstab 中的 swap 配置
+    local fstab_swaps
+    fstab_swaps=$(grep -E '\sswap\s' /etc/fstab 2>/dev/null || true)
+    if [[ -z "$fstab_swaps" ]]; then
+        info "/etc/fstab 中没有 Swap 配置"
+    else
+        info "/etc/fstab 中的 Swap 配置:"
+        echo "$fstab_swaps" | while IFS= read -r line; do echo "  $line"; done
+    fi
+    # 显示 /etc/linux-helper swap 记录
+    local record_file="/etc/linux-helper/swap-record"
+    if [[ -f "$record_file" ]]; then
+        echo ""
+        info "Linux Helper 管理的 Swap 文件: $(cat "$record_file")"
+    fi
+    echo ""
+}
+
+swap_add() {
+    echo ""
+    header "添加 Swap"
+
+    # 默认路径
+    local swap_path="/swapfile"
+    local default_size_mb=1024
+
+    read -p "Swap 文件路径 [${swap_path}]: " input_path
+    [[ -n "$input_path" ]] && swap_path="$input_path"
+
+    # 检查是否已存在
+    if [[ -f "$swap_path" ]]; then
+        if swapon --show | grep -q "$swap_path"; then
+            warn "$swap_path 已作为 Swap 在使用"
+            read -p "请先删除现有 Swap 后再添加。按回车键返回..."
+            return
+        fi
+    fi
+
+    # 输入大小
+    local size_input
+    read -p "Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
+    size_input="${size_input:-$default_size_mb}"
+    if [[ ! "$size_input" =~ ^[0-9]+$ ]] || (( size_input < 1 )); then
+        warn "无效大小，请输入正整数（单位 MB）"
+        return
+    fi
+
+    # 检查磁盘空间
+    local target_dir
+    target_dir="$(dirname "$swap_path")"
+    local available_kb
+    available_kb=$(df "$target_dir" 2>/dev/null | tail -1 | awk '{print $4}')
+    local needed_kb=$((size_input * 1024))
+    if [[ -n "$available_kb" ]] && (( available_kb < needed_kb )); then
+        warn "磁盘空间不足！需要 ${size_input}MB，可用约 $((available_kb / 1024))MB"
+        confirm "仍然继续？" || return
+    fi
+
+    echo ""
+    info "创建 Swap 文件: ${swap_path} (${size_input}MB)..."
+    echo ""
+
+    # 创建 swap 文件（优先 fallocate，回退 dd）
+    if command -v fallocate &>/dev/null; then
+        fallocate -l "${size_input}M" "$swap_path" 2>/dev/null || {
+            info "fallocate 失败，使用 dd 创建..."
+            dd if=/dev/zero of="$swap_path" bs=1M count="$size_input" status=progress 2>&1
+        }
+    else
+        dd if=/dev/zero of="$swap_path" bs=1M count="$size_input" status=progress 2>&1
+    fi || {
+        error "创建 Swap 文件失败"
+        return
+    }
+    chmod 600 "$swap_path"
+
+    # 检查文件系统是否支持 swap file（btrfs 需特殊处理）
+    local swap_fs
+    swap_fs=$(df -T "$swap_path" 2>/dev/null | tail -1 | awk '{print $2}')
+    if [[ "$swap_fs" == "btrfs" ]]; then
+        info "检测到 btrfs 文件系统，创建 swap 子卷..."
+        # btrfs 需要禁用 CoW
+        chattr +C "$swap_path" 2>/dev/null || true
+    fi
+
+    # 格式化为 swap
+    mkswap "$swap_path" || {
+        error "格式化 Swap 失败"
+        rm -f "$swap_path"
+        return
+    }
+
+    # 启用
+    swapon "$swap_path" || {
+        error "启用 Swap 失败"
+        rm -f "$swap_path"
+        return
+    }
+
+    # 写入 fstab（检查是否已有）
+    if grep -q "$swap_path" /etc/fstab 2>/dev/null; then
+        info "$swap_path 已存在于 /etc/fstab"
+    else
+        echo "$swap_path none swap sw 0 0" >> /etc/fstab
+        success "已添加到 /etc/fstab"
+    fi
+
+    # 记录到 linux-helper
+    mkdir -p /etc/linux-helper
+    echo "$swap_path" > /etc/linux-helper/swap-record
+
+    success "Swap 添加成功！"
+    echo ""
+    swap_show_status
+}
+
+swap_delete() {
+    echo ""
+    header "删除 Swap"
+
+    # 显示当前 swap
+    if ! swapon --show 2>/dev/null | grep -q .; then
+        info "没有启用中的 Swap 设备"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    swapon --show
+    echo ""
+
+    # 检测路径
+    local swap_paths=()
+    local swaplist
+    swaplist=$(swapon --show --noheadings 2>/dev/null | awk '{print $1}') || true
+    if [[ -n "$swaplist" ]]; then
+        while IFS= read -r path; do
+            [[ -n "$path" ]] && swap_paths+=("$path")
+        done <<< "$swaplist"
+    fi
+
+    if [[ ${#swap_paths[@]} -eq 0 ]]; then
+        info "未检测到 Swap 设备"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    local target=""
+    if [[ ${#swap_paths[@]} -eq 1 ]]; then
+        target="${swap_paths[0]}"
+        info "检测到一个 Swap 设备: $target"
+        confirm "删除此 Swap？" || return
+    else
+        echo "选择要删除的 Swap 设备:"
+        local i
+        for i in "${!swap_paths[@]}"; do
+            echo "  $((i+1))) ${swap_paths[$i]}"
+        done
+        echo ""
+        read -p "请输入编号: " sel
+        [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#swap_paths[@]} )) || {
+            warn "无效选择"; return
+        }
+        target="${swap_paths[$((sel-1))]}"
+        confirm "删除 Swap: ${target}？" || return
+    fi
+
+    # swapoff
+    swapoff "$target" 2>/dev/null || {
+        error "swapoff 失败"
+        return
+    }
+    success "已停用: $target"
+
+    # 从 fstab 移除（精确匹配路径）
+    sed -i "\|^${target}\s|d" /etc/fstab
+    # 也匹配带前导空格的变体
+    sed -i "s|^[[:space:]]*${target}[[:space:]].*||" /etc/fstab
+    # 清理残留空行
+    sed -i '/^[[:space:]]*$/d' /etc/fstab
+    success "已从 /etc/fstab 移除"
+
+    # 如果是文件 swap，询问是否删除文件
+    if [[ -f "$target" ]]; then
+        if confirm "删除 swap 文件 ${target}？"; then
+            rm -f "$target"
+            success "已删除文件: $target"
+        fi
+    fi
+
+    # 清理记录
+    local record_file="/etc/linux-helper/swap-record"
+    if [[ -f "$record_file" ]] && grep -q "$target" "$record_file" 2>/dev/null; then
+        rm -f "$record_file"
+    fi
+
+    echo ""
+    success "Swap 删除完成"
+}
+
+swap_adjust() {
+    echo ""
+    header "调整 Swap"
+
+    local swap_path="/swapfile"
+    local default_size_mb=2048
+
+    read -p "Swap 文件路径 [${swap_path}]: " input_path
+    [[ -n "$input_path" ]] && swap_path="$input_path"
+
+    echo ""
+    warn "调整操作将:"
+    echo "  1. 删除 ${swap_path}（如存在）"
+    echo "  2. 重新创建指定大小的 Swap"
+    echo ""
+
+    confirm "确认调整？" || return
+
+    # 步骤1：如果存在则删除
+    if [[ -f "$swap_path" ]] && swapon --show 2>/dev/null | grep -q "$swap_path"; then
+        info "停用旧 Swap: $swap_path"
+        swapoff "$swap_path" 2>/dev/null || true
+    fi
+
+    if [[ -f "$swap_path" ]]; then
+        info "删除旧 Swap 文件: $swap_path"
+        rm -f "$swap_path"
+    fi
+
+    # 从 fstab 清理
+    sed -i "\|${swap_path}|d" /etc/fstab
+
+    # 步骤2：添加新的
+    local size_input
+    read -p "新的 Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
+    size_input="${size_input:-$default_size_mb}"
+    if [[ ! "$size_input" =~ ^[0-9]+$ ]] || (( size_input < 1 )); then
+        warn "无效大小，请输入正整数（单位 MB）"
+        return
+    fi
+
+    # 检查磁盘空间
+    local target_dir
+    target_dir="$(dirname "$swap_path")"
+    local available_kb
+    available_kb=$(df "$target_dir" 2>/dev/null | tail -1 | awk '{print $4}')
+    local needed_kb=$((size_input * 1024))
+    if [[ -n "$available_kb" ]] && (( available_kb < needed_kb )); then
+        warn "磁盘空间不足！需要 ${size_input}MB，可用约 $((available_kb / 1024))MB"
+        confirm "仍然继续？" || return
+    fi
+
+    echo ""
+    info "创建新的 Swap 文件: ${swap_path} (${size_input}MB)"
+    if command -v fallocate &>/dev/null; then
+        fallocate -l "${size_input}M" "$swap_path" 2>/dev/null || {
+            info "fallocate 失败，使用 dd 创建..."
+            dd if=/dev/zero of="$swap_path" bs=1M count="$size_input" status=progress 2>&1
+        }
+    else
+        dd if=/dev/zero of="$swap_path" bs=1M count="$size_input" status=progress 2>&1
+    fi || {
+        error "创建 Swap 文件失败"
+        return
+    }
+    chmod 600 "$swap_path"
+
+    local swap_fs
+    swap_fs=$(df -T "$swap_path" 2>/dev/null | tail -1 | awk '{print $2}')
+    if [[ "$swap_fs" == "btrfs" ]]; then
+        info "检测到 btrfs 文件系统，创建 swap 子卷..."
+        chattr +C "$swap_path" 2>/dev/null || true
+    fi
+
+    mkswap "$swap_path" || {
+        error "格式化 Swap 失败"
+        rm -f "$swap_path"
+        return
+    }
+
+    swapon "$swap_path" || {
+        error "启用 Swap 失败"
+        rm -f "$swap_path"
+        return
+    }
+
+    # fstab
+    if ! grep -q "$swap_path" /etc/fstab 2>/dev/null; then
+        echo "$swap_path none swap sw 0 0" >> /etc/fstab
+    fi
+
+    # 记录
+    mkdir -p /etc/linux-helper
+    echo "$swap_path" > /etc/linux-helper/swap-record
+
+    success "Swap 调整完成！"
+    echo ""
+    swap_show_status
+}
+
+# ---------- Swap 菜单 ----------
+
+swap_menu() {
+    while true; do
+        clear; header "Swap 管理"
+        echo "  1) 查看 Swap 状态"
+        echo "  2) 添加 Swap"
+        echo "  3) 删除 Swap"
+        echo "  4) 调整 Swap（删除后重建）"
+        echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
+        read -p "  请选择: " choice
+        case "$choice" in
+            1) swap_show_status ; read -p "按回车键继续..." ;;
+            2) swap_add ;;
+            3) swap_delete ;;
+            4) swap_adjust ;;
+            b|B) break ;;
+            q|Q) exit 0 ;;
+            *) warn "无效选项" ; read -p "按回车键继续..." ;;
+        esac
+    done
+}
+
 tuning_menu() {
     while true; do
         clear; header "系统调优"
@@ -676,7 +1013,7 @@ tuning_menu() {
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
         read -p "  请选择: " choice
         case "$choice" in
-            1) placeholder "Swap 管理" ;;
+            1) swap_menu ;;
             2) placeholder "内核参数优化" ;;
             3) placeholder "文件描述符限制" ;;
             b|B) break ;;
