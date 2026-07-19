@@ -254,10 +254,10 @@ ipv6_disable() {
     info "处理 /etc/hosts 中的 IPv6 记录..."
     # 先备份 /etc/hosts
     cp "$HOSTS_FILE" "$HOSTS_FILE.lh-bak-ipv6-$ts"
-    # 注释掉 IPv6 记录（::1, ff02:: 等标准 IPv6 hosts）
-    sed -i -E 's/^(::1\s+|ff02::)/#\1/' "$HOSTS_FILE"
+    # 注释掉 IPv6 记录（::1, ff02:: 等标准 IPv6 hosts，含前导空格）
+    sed -i -E 's/^[[:space:]]*(::1\s+|ff02::)/#\1/' "$HOSTS_FILE"
     # 也处理其他 fe80/200x/3ffe 等 IPv6 地址开头的行
-    sed -i -E 's/^([a-f0-9]{2,4}:)/#\1/' "$HOSTS_FILE" 2>/dev/null || true
+    sed -i -E 's/^[[:space:]]*([a-f0-9]{2,4}:)/#\1/' "$HOSTS_FILE" 2>/dev/null || true
     success "/etc/hosts 已处理"
 
     # 3. sysctl 配置
@@ -277,7 +277,7 @@ ipv6_disable() {
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
-    sysctl -p /etc/sysctl.d/99-lh-disable-ipv6.conf 2>&1 | head -5
+    sysctl -p /etc/sysctl.d/99-lh-disable-ipv6.conf 2>&1 | head -5 || true
     success "sysctl 已生效"
 
     # 4. SSH 配置：限制为 ipv4
@@ -330,9 +330,9 @@ ipv6_enable() {
 
     # 1. 恢复 /etc/hosts 中的 IPv6 记录
     info "恢复 /etc/hosts 中的 IPv6 记录..."
-    # 取消注释之前被注释的 IPv6 行
-    sed -i -E 's/^#(::1\s+|ff02::)/\1/' "$HOSTS_FILE"
-    sed -i -E 's/^#([a-f0-9]{2,4}:)/\1/' "$HOSTS_FILE" 2>/dev/null || true
+    # 取消注释之前被注释的 IPv6 行（含前导空格）
+    sed -i -E 's/^[[:space:]]*#(::1\s+|ff02::)/\1/' "$HOSTS_FILE"
+    sed -i -E 's/^[[:space:]]*#([a-f0-9]{2,4}:)/\1/' "$HOSTS_FILE" 2>/dev/null || true
     # 检查是否已恢复
     local has_ipv6_hosts
     has_ipv6_hosts=$(grep -cE '^\s*::' "$HOSTS_FILE" 2>/dev/null || true)
@@ -511,8 +511,12 @@ ssh_find_setting() {
 # 获取某个 SSH 配置项的实际生效值
 ssh_get_setting() {
     local key="$1"
-    # 从后往前查找，最后一个匹配即为生效值
-    local val=""
+    local last_val=""
+    # 先检查主配置文件（优先级低）
+    local val
+    val=$(grep -E "^\s*${key}\s+" "$SSHD_CONFIG" 2>/dev/null | tail -1 | awk '{print $2}')
+    [[ -n "$val" ]] && last_val="$val"
+    # 再检查 drop-in 文件（按字母序，越晚优先级越高，覆盖主配置）
     if [[ -d "$SSHD_CONFIG_DIR" ]]; then
         for f in "$SSHD_CONFIG_DIR"/*.conf; do
             [[ -f "$f" ]] || continue
@@ -520,8 +524,6 @@ ssh_get_setting() {
             [[ -n "$val" ]] && last_val="$val"
         done
     fi
-    val=$(grep -E "^\s*${key}\s+" "$SSHD_CONFIG" 2>/dev/null | tail -1 | awk '{print $2}')
-    [[ -n "$val" ]] && last_val="$val"
     echo "${last_val:-}"
 }
 
@@ -1173,8 +1175,8 @@ swap_adjust() {
         rm -f "$swap_path"
     fi
 
-    # 从 fstab 清理
-    sed -i "\|${swap_path}|d" /etc/fstab
+    # 从 fstab 清理（精确匹配路径，防止误删）
+    sed -i "\|^${swap_path}\s|d" /etc/fstab
 
     # 步骤2：添加新的
     local size_input
