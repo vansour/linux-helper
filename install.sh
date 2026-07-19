@@ -172,18 +172,275 @@ EOF
     success "BBR 优化完成！"
 }
 
+# ---------- IPv6 管理 ----------
+
+IPv6_BACKUP_DIR="/etc/linux-helper/backups"
+HOSTS_FILE="/etc/hosts"
+
+ipv6_show_status() {
+    echo ""
+    header "当前 IPv6 状态"
+
+    local disabled
+    disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)
+
+    if [[ "$disabled" == "1" ]]; then
+        echo -e "  系统 IPv6: ${RED}已禁用${NC}"
+    else
+        echo -e "  系统 IPv6: ${GREEN}已启用${NC}"
+    fi
+
+    echo ""
+    echo "  GRUB 参数:"
+    if grep -q 'ipv6.disable=1' /etc/default/grub 2>/dev/null; then
+        echo -e "    ${YELLOW}ipv6.disable=1${NC} (在 GRUB 中禁用)"
+    elif grep -q 'ipv6.disable=0' /etc/default/grub 2>/dev/null; then
+        echo -e "    ${GREEN}ipv6.disable=0${NC} (在 GRUB 中启用)"
+    else
+        echo -e "    ${BLUE}未设置${NC}"
+    fi
+
+    echo ""
+    echo "  sysctl 配置:"
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [[ -f "$f" ]] || continue
+        local line
+        line=$(grep -E 'disable_ipv6' "$f" 2>/dev/null || true)
+        if [[ -n "$line" ]]; then
+            echo -e "    $f: ${YELLOW}$line${NC}"
+        fi
+    done
+
+    echo ""
+    echo "  /etc/hosts IPv6 记录:"
+    local ipv6_hosts
+    ipv6_hosts=$(grep -E '^\s*::' "$HOSTS_FILE" 2>/dev/null || true)
+    if [[ -n "$ipv6_hosts" ]]; then
+        echo "$ipv6_hosts" | while IFS= read -r line; do
+            if echo "$line" | grep -qE '^\s*#'; then
+                echo -e "    ${YELLOW}(已注释)${NC} $line"
+            else
+                echo -e "    ${GREEN}$line${NC}"
+            fi
+        done
+    else
+        echo "    (无)"
+    fi
+
+    echo ""
+    if command -v ip &>/dev/null; then
+        echo "  网卡 IPv6 地址:"
+        ip -6 addr show 2>/dev/null | grep -E 'inet6' | head -5 | sed 's/^/    /' || echo "    (无)"
+    fi
+    echo ""
+}
+
+ipv6_disable() {
+    echo ""
+    header "禁用 IPv6"
+
+    confirm "禁用 IPv6？这将修改 sysctl、GRUB、/etc/hosts 和 SSH 配置" || return
+
+    mkdir -p "$IPv6_BACKUP_DIR"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    local bkup="$IPv6_BACKUP_DIR/ipv6-backup-$ts"
+    mkdir -p "$bkup"
+
+    # 1. 备份 hosts
+    cp "$HOSTS_FILE" "$bkup/hosts"
+
+    # 2. 修改 /etc/hosts：注释掉 IPv6 主机记录
+    info "处理 /etc/hosts 中的 IPv6 记录..."
+    # 先备份 /etc/hosts
+    cp "$HOSTS_FILE" "$HOSTS_FILE.lh-bak-ipv6-$ts"
+    # 注释掉 IPv6 记录（::1, ff02:: 等标准 IPv6 hosts）
+    sed -i -E 's/^(::1\s+|ff02::)/#\1/' "$HOSTS_FILE"
+    # 也处理其他 fe80/200x/3ffe 等 IPv6 地址开头的行
+    sed -i -E 's/^([a-f0-9]{2,4}:)/#\1/' "$HOSTS_FILE" 2>/dev/null || true
+    success "/etc/hosts 已处理"
+
+    # 3. sysctl 配置
+    info "配置 sysctl 禁用 IPv6..."
+    mkdir -p /etc/sysctl.d
+    # 从所有 sysctl 文件中清理已有的 disable_ipv6
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [[ -f "$f" ]] || continue
+        grep -qE 'disable_ipv6' "$f" 2>/dev/null || continue
+        cp "$f" "$bkup/$(basename "$f")" 2>/dev/null || true
+        sed -i '/disable_ipv6/d' "$f"
+        info "  已清理: $f"
+    done
+    # 写入统一的禁用配置
+    cat > /etc/sysctl.d/99-lh-disable-ipv6.conf << 'EOF'
+# 禁用 IPv6 — Linux Helper
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+    sysctl -p /etc/sysctl.d/99-lh-disable-ipv6.conf 2>&1 | head -5
+    success "sysctl 已生效"
+
+    # 4. SSH 配置：限制为 ipv4
+    info "配置 SSH 仅监听 IPv4..."
+    SSHD_CONFIG="/etc/ssh/sshd_config"
+    if grep -qE '^\s*AddressFamily' "$SSHD_CONFIG" 2>/dev/null; then
+        cp "$SSHD_CONFIG" "$bkup/sshd_config" 2>/dev/null || true
+        sed -i 's/^\s*AddressFamily.*/AddressFamily inet/' "$SSHD_CONFIG"
+    else
+        echo "AddressFamily inet" >> "$SSHD_CONFIG"
+    fi
+    # 也清理 drop-in 中的 AddressFamily
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -f "$f" ]] || continue
+            grep -qE '^\s*AddressFamily' "$f" 2>/dev/null || continue
+            sed -i '/^\s*AddressFamily/d' "$f"
+            info "  已清理 SSH drop-in: $f"
+        done
+    fi
+    sshd -t 2>/dev/null && systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    success "SSH 已配置仅 IPv4"
+
+    # 5. GRUB 配置
+    info "配置 GRUB 内核参数..."
+    cp /etc/default/grub "$bkup/grub" 2>/dev/null || true
+    if grep -q 'ipv6.disable=' /etc/default/grub 2>/dev/null; then
+        sed -i 's/ipv6.disable=[0-9]/ipv6.disable=1/' /etc/default/grub
+    else
+        sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"/' /etc/default/grub
+    fi
+    info "GRUB 配置已更新（需要 grub-mkconfig -o /boot/grub/grub.cfg 后重启生效）"
+    info "可运行 update-grub 更新 GRUB（可选，重启生效）"
+
+    echo ""
+    success "IPv6 禁用配置完成！部分更改需重启后完全生效。"
+    echo ""
+    ipv6_show_status
+}
+
+ipv6_enable() {
+    echo ""
+    header "启用 IPv6"
+
+    confirm "启用 IPv6？这将恢复 sysctl、GRUB、/etc/hosts 和 SSH 配置" || return
+
+    mkdir -p "$IPv6_BACKUP_DIR"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+
+    # 1. 恢复 /etc/hosts 中的 IPv6 记录
+    info "恢复 /etc/hosts 中的 IPv6 记录..."
+    # 取消注释之前被注释的 IPv6 行
+    sed -i -E 's/^#(::1\s+|ff02::)/\1/' "$HOSTS_FILE"
+    sed -i -E 's/^#([a-f0-9]{2,4}:)/\1/' "$HOSTS_FILE" 2>/dev/null || true
+    # 检查是否已恢复
+    local has_ipv6_hosts
+    has_ipv6_hosts=$(grep -cE '^\s*::' "$HOSTS_FILE" 2>/dev/null || true)
+    if [[ "$has_ipv6_hosts" -eq 0 ]]; then
+        # 如果没有标准的 IPv6 hosts，重新添加
+        cat >> "$HOSTS_FILE" << 'EOF'
+::1     localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+    fi
+    success "/etc/hosts 已恢复"
+
+    # 2. sysctl 启用 IPv6
+    info "配置 sysctl 启用 IPv6..."
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [[ -f "$f" ]] || continue
+        grep -qE 'disable_ipv6' "$f" 2>/dev/null || continue
+        cp "$f" "$IPv6_BACKUP_DIR/$(basename "$f").bak.$ts" 2>/dev/null || true
+        sed -i '/disable_ipv6/d' "$f"
+        info "  已清理: $f"
+    done
+
+    # 如果存在我们的禁用文件，删除它
+    rm -f /etc/sysctl.d/99-lh-disable-ipv6.conf
+
+    # 立即生效（设置为 0）
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null || true
+    info "sysctl 已清理"
+
+    # 3. SSH 恢复所有地址族
+    info "恢复 SSH 监听所有地址..."
+    SSHD_CONFIG="/etc/ssh/sshd_config"
+    if grep -qE '^\s*AddressFamily' "$SSHD_CONFIG" 2>/dev/null; then
+        sed -i '/^\s*AddressFamily/d' "$SSHD_CONFIG"
+    fi
+    if [[ -d /etc/ssh/sshd_config.d ]]; then
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [[ -f "$f" ]] || continue
+            grep -qE '^\s*AddressFamily' "$f" 2>/dev/null || continue
+            sed -i '/^\s*AddressFamily/d' "$f"
+        done
+    fi
+    sshd -t 2>/dev/null && systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    success "SSH 已恢复监听所有地址"
+
+    # 4. GRUB 配置
+    info "配置 GRUB 移除 ipv6.disable..."
+    if grep -q 'ipv6.disable=' /etc/default/grub 2>/dev/null; then
+        cp /etc/default/grub "$IPv6_BACKUP_DIR/grub.bak.$ts" 2>/dev/null || true
+        sed -i 's/ipv6.disable=[0-9]//g' /etc/default/grub
+        # 清理多余空格
+        sed -i 's/  */ /g' /etc/default/grub
+        success "GRUB 已更新"
+    fi
+
+    echo ""
+    success "IPv6 启用配置完成！部分更改需重启后完全生效。"
+    echo ""
+    ipv6_show_status
+}
+
+ipv6_menu() {
+    while true; do
+        clear; header "IPv6 管理"
+
+        local disabled
+        disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)
+        if [[ "$disabled" == "1" ]]; then
+            echo -e "  当前状态: ${RED}IPv6 已禁用${NC}"
+        else
+            echo -e "  当前状态: ${GREEN}IPv6 已启用${NC}"
+        fi
+        echo ""
+        echo "  1) 查看 IPv6 状态"
+        echo "  2) 禁用 IPv6"
+        echo "  3) 启用 IPv6"
+        echo ""
+        echo "  b) 返回主菜单"
+        echo "  q) 退出脚本"
+        echo ""
+        read -p "  请选择: " choice
+        case "$choice" in
+            1) ipv6_show_status ; read -p "按回车键继续..." ;;
+            2) ipv6_disable ;;
+            3) ipv6_enable ;;
+            b|B) break ;;
+            q|Q) exit 0 ;;
+            *) warn "无效选项" ; read -p "按回车键继续..." ;;
+        esac
+    done
+}
+
 network_menu() {
     while true; do
         clear; header "网络优化"
         echo "  1) 启用 BBR + fq + bpftune"
         echo "  2) TCP 参数调优"
         echo "  3) 查看网络状态"
+        echo "  4) IPv6 管理"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
         read -p "  请选择: " choice
         case "$choice" in
             1) enable_bbr ;;
             2) placeholder "TCP 参数调优" ;;
             3) placeholder "查看网络状态" ;;
+            4) ipv6_menu ;;
             b|B) break ;;
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
