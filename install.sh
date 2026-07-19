@@ -706,7 +706,10 @@ swap_add() {
 
     # 默认路径
     local swap_path="/swapfile"
-    local default_size_mb=1024
+    local mem_total_mb
+    mem_total_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local default_size_mb=$(( mem_total_mb - 1024 ))
+    (( default_size_mb < 1024 )) && default_size_mb=$((mem_total_mb / 2))
 
     read -p "Swap 文件路径 [${swap_path}]: " input_path
     [[ -n "$input_path" ]] && swap_path="$input_path"
@@ -886,7 +889,10 @@ swap_adjust() {
     header "调整 Swap"
 
     local swap_path="/swapfile"
-    local default_size_mb=2048
+    local mem_total_mb
+    mem_total_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local default_size_mb=$(( mem_total_mb - 1024 ))
+    (( default_size_mb < 1024 )) && default_size_mb=$((mem_total_mb / 2))
 
     read -p "Swap 文件路径 [${swap_path}]: " input_path
     [[ -n "$input_path" ]] && swap_path="$input_path"
