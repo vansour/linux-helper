@@ -1,0 +1,4 @@
+# Linux Helper .gitignore
+*.bak
+*.swp
+backups/
