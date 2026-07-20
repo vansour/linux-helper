@@ -28,7 +28,7 @@
 
 ```bash
 # 一行命令下载并安装
-sudo bash -c "$(curl -sSL https://github.com/vansour/linux-helper/releases/latest/download/install.sh)"
+sudo bash -c "$(curl -sSL https://raw.githubusercontent.com/vansour/linux-helper/main/install.sh)"
 
 # 之后直接运行
 sudo linux-helper
