@@ -24,6 +24,11 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # ============================================================
+# 全局常量
+# ============================================================
+BACKUP_DIR="/etc/linux-helper/backups"
+
+# ============================================================
 # 通用函数
 # ============================================================
 check_root() {
@@ -36,7 +41,7 @@ check_root() {
 confirm() {
     local prompt="${1:-确认继续？}"
     local reply
-    read -p "$prompt [y/N]: " -r reply
+    read -r -p "$prompt [y/N]: " reply
     [[ $reply =~ ^[Yy] ]]
 }
 
@@ -70,7 +75,7 @@ enable_bbr() {
     header "开启 BBR + fq + bpftune"
 
     # 1. 备份旧的 sysctl 配置
-    local backup_dir="/etc/linux-helper/backups"
+    local backup_dir="$BACKUP_DIR"
     local backup_file="$backup_dir/sysctl-backup-$(date +%Y%m%d-%H%M%S).conf"
     mkdir -p "$backup_dir"
 
@@ -174,7 +179,6 @@ EOF
 
 # ---------- IPv6 管理 ----------
 
-IPv6_BACKUP_DIR="/etc/linux-helper/backups"
 HOSTS_FILE="/etc/hosts"
 
 ipv6_show_status() {
@@ -241,10 +245,10 @@ ipv6_disable() {
 
     confirm "禁用 IPv6？这将修改 sysctl、GRUB、/etc/hosts 和 SSH 配置" || return
 
-    mkdir -p "$IPv6_BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
-    local bkup="$IPv6_BACKUP_DIR/ipv6-backup-$ts"
+    local bkup="$BACKUP_DIR/ipv6-backup-$ts"
     mkdir -p "$bkup"
 
     # 1. 备份 hosts
@@ -324,7 +328,7 @@ ipv6_enable() {
 
     confirm "启用 IPv6？这将恢复 sysctl、GRUB、/etc/hosts 和 SSH 配置" || return
 
-    mkdir -p "$IPv6_BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
     local ts
     ts=$(date +%Y%m%d-%H%M%S)
 
@@ -351,7 +355,7 @@ EOF
     for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
         [[ -f "$f" ]] || continue
         grep -qE 'disable_ipv6' "$f" 2>/dev/null || continue
-        cp "$f" "$IPv6_BACKUP_DIR/$(basename "$f").bak.$ts" 2>/dev/null || true
+        cp "$f" "$BACKUP_DIR/$(basename "$f").bak.$ts" 2>/dev/null || true
         sed -i '/disable_ipv6/d' "$f"
         info "  已清理: $f"
     done
@@ -383,7 +387,7 @@ EOF
     # 4. GRUB 配置
     info "配置 GRUB 移除 ipv6.disable..."
     if grep -q 'ipv6.disable=' /etc/default/grub 2>/dev/null; then
-        cp /etc/default/grub "$IPv6_BACKUP_DIR/grub.bak.$ts" 2>/dev/null || true
+        cp /etc/default/grub "$BACKUP_DIR/grub.bak.$ts" 2>/dev/null || true
         sed -i 's/ipv6.disable=[0-9]//g' /etc/default/grub
         # 清理多余空格
         sed -i 's/  */ /g' /etc/default/grub
@@ -398,7 +402,7 @@ EOF
 
 ipv6_menu() {
     while true; do
-        clear; header "IPv6 管理"
+        clear || true; header "IPv6 管理"
 
         local disabled
         disabled=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)
@@ -415,27 +419,27 @@ ipv6_menu() {
         echo "  b) 返回主菜单"
         echo "  q) 退出脚本"
         echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
-            1) ipv6_show_status ; read -p "按回车键继续..." ;;
+            1) ipv6_show_status ; read -r -p "按回车键继续..." ;;
             2) ipv6_disable ;;
             3) ipv6_enable ;;
             b|B) break ;;
             q|Q) exit 0 ;;
-            *) warn "无效选项" ; read -p "按回车键继续..." ;;
+            *) warn "无效选项" ; read -r -p "按回车键继续..." ;;
         esac
     done
 }
 
 network_menu() {
     while true; do
-        clear; header "网络优化"
+        clear || true; header "网络优化"
         echo "  1) 启用 BBR + fq + bpftune"
         echo "  2) TCP 参数调优"
         echo "  3) 查看网络状态"
         echo "  4) IPv6 管理"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) enable_bbr ;;
             2) placeholder "TCP 参数调优" ;;
@@ -445,30 +449,405 @@ network_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
 # ============================================================
 # 模块：系统配置
 # ============================================================
+
+# ---------- 时区 & 时间同步（强制 Chrony） ----------
+
+timezone_show_status() {
+    echo ""
+    header "当前时间配置"
+    echo ""
+    echo -e "  系统时区:   ${GREEN}$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")${NC}"
+    echo -e "  本地时间:   ${BLUE}$(date +'%Y-%m-%d %H:%M:%S %Z')${NC}"
+    echo -e "  UTC 时间:   ${BLUE}$(date -u +'%Y-%m-%d %H:%M:%S UTC')${NC}"
+    echo ""
+    echo -e "  NTP 服务状态:"
+    if systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo -e "    ${GREEN}chronyd${NC}  运行中 ✓"
+    elif systemctl is-active --quiet chrony 2>/dev/null; then
+        echo -e "    ${GREEN}chrony${NC}   运行中 ✓"
+    elif systemctl is-active --quiet ntpd 2>/dev/null; then
+        echo -e "    ${YELLOW}ntpd${NC}     运行中（建议迁移到 chrony）"
+    elif systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        echo -e "    ${YELLOW}systemd-timesyncd${NC}  运行中（建议迁移到 chrony）"
+    else
+        echo -e "    ${RED}未运行${NC}"
+    fi
+    if command -v chronyc &>/dev/null; then
+        local leap_status
+        leap_status=$(chronyc tracking 2>/dev/null | awk -F': ' '/Leap status/{print $2}') || true
+        if [[ -n "$leap_status" ]]; then
+            echo -e "    同步状态:   ${GREEN}${leap_status}${NC}"
+        fi
+    fi
+    echo ""
+}
+
+chrony_force_setup() {
+    local user_tz="${1:-}"
+    echo ""
+    header "强制使用 Chrony 时间同步"
+
+    mkdir -p "$BACKUP_DIR"
+
+    # 1. 安装 chrony（先装好再停老服务，最小化时间同步间隙）
+    if ! command -v chronyd &>/dev/null || ! command -v chronyc &>/dev/null; then
+        info "正在安装 chrony..."
+        local install_ok=0
+        if command -v apt &>/dev/null; then
+            apt update -qq && DEBIAN_FRONTEND=noninteractive apt install -y chrony && install_ok=1
+        elif command -v dnf &>/dev/null; then
+            dnf install -y chrony && install_ok=1
+        elif command -v yum &>/dev/null; then
+            yum install -y chrony && install_ok=1
+        elif command -v zypper &>/dev/null; then
+            zypper install -y chrony && install_ok=1
+        else
+            error "不支持的包管理器，请手动安装: apt install chrony"
+            return 1
+        fi
+        if (( install_ok )); then
+            success "chrony 安装成功"
+        else
+            error "chrony 安装失败"
+            return 1
+        fi
+    else
+        success "chrony 已安装"
+    fi
+
+    # 2. 检测并停用冲突的 NTP 服务（此时 chrony 已就绪）
+    local conflict_found=0
+    for svc in systemd-timesyncd ntpd openntpd ntp; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            warn "停止冲突服务: $svc"
+            systemctl stop "$svc" 2>/dev/null || true
+            conflict_found=1
+        fi
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            info "禁用冲突服务: $svc"
+            systemctl disable "$svc" 2>/dev/null || true
+        fi
+    done
+    timedatectl set-ntp false 2>/dev/null || true
+    if (( conflict_found )); then
+        success "已停用冲突的 NTP 服务"
+    fi
+
+    # 3. 备份现有配置
+    local chrony_conf
+    if [[ -f "/etc/chrony.conf" ]]; then
+        chrony_conf="/etc/chrony.conf"
+    else
+        chrony_conf="/etc/chrony/chrony.conf"
+    fi
+    local chrony_bak
+    chrony_bak="$BACKUP_DIR/chrony.conf.bak.$(date +%Y%m%d-%H%M%S)"
+    if [[ -f "$chrony_conf" ]]; then
+        cp "$chrony_conf" "$chrony_bak" 2>/dev/null || true
+    fi
+
+    # 4. 根据时区确定最近的 NTP 池
+    local current_tz
+    if [[ -n "$user_tz" ]]; then
+        current_tz="$user_tz"
+    else
+        current_tz="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
+    fi
+    local region="${current_tz%%/*}"
+    local ntp_pool
+    case "$region" in
+        Asia)                ntp_pool="asia.pool.ntp.org" ;;
+        Europe)              ntp_pool="europe.pool.ntp.org" ;;
+        America|US|Canada)   ntp_pool="north-america.pool.ntp.org" ;;
+        Pacific|Australia)   ntp_pool="oceania.pool.ntp.org" ;;
+        Africa)              ntp_pool="africa.pool.ntp.org" ;;
+        *)                   ntp_pool="pool.ntp.org" ;;
+    esac
+
+    # 5. 写入 chrony 配置
+    cat > "$chrony_conf" << CHRONYEOF
+# Chrony 配置文件 — Linux Helper
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# 时区: ${current_tz:-UTC}
+
+# NTP 服务器池（根据时区自动选择最近节点）
+pool ${ntp_pool} iburst
+
+# 备用 NTP 服务器
+pool pool.ntp.org iburst
+server ntp.aliyun.com iburst
+server time.google.com iburst
+
+# 漂移文件（记录时钟频率偏差）
+driftfile /var/lib/chrony/drift
+
+# 快速同步 — 启动后偏差 >1 秒时前 3 次立即调整
+makestep 1.0 3
+
+# 硬件时钟同步
+rtcsync
+
+# 本地监听（仅允许本机使用 chronyc）
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+
+# 日志目录
+logdir /var/log/chrony
+CHRONYEOF
+    success "chrony 配置文件已更新 (${chrony_conf})"
+
+    # 6. 检查配置语法（类比 sshd -t）
+    if command -v chronyd &>/dev/null; then
+        if ! chronyd -t -f "$chrony_conf" 2>/dev/null; then
+            error "chrony 配置语法错误！请检查 $chrony_conf"
+            return 1
+        fi
+        success "chrony 配置语法正确"
+    fi
+
+    # 7. 启用并启动 chrony 服务
+    info "启动 chronyd 服务..."
+    systemctl enable chronyd 2>/dev/null || systemctl enable chrony 2>/dev/null || {
+        warn "chrony 服务启用失败，请手动检查: systemctl enable chronyd"
+    }
+    systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null || {
+        warn "chrony 服务启动失败，请手动检查: systemctl status chronyd"
+    }
+
+    # 8. 立即同步时间（不用 -a：无身份验证密钥时也能通过本地 socket 运行）
+    sleep 1
+    chronyc makestep 2>/dev/null || true
+
+    # 9. 验证并输出状态
+    echo ""
+    local chrony_active=0
+    if systemctl is-active --quiet chronyd 2>/dev/null || systemctl is-active --quiet chrony 2>/dev/null; then
+        chrony_active=1
+        success "chrony 服务运行中 ✓"
+        if command -v chronyc &>/dev/null; then
+            echo ""
+            echo -e "  ${BLUE}chronyc tracking:${NC}"
+            chronyc tracking 2>/dev/null | sed 's/^/    /'
+            echo ""
+            echo -e "  ${BLUE}chronyc sources -v:${NC}"
+            chronyc sources -v 2>/dev/null | sed 's/^/    /'
+        fi
+    else
+        warn "chrony 服务状态异常，请手动检查:"
+        echo "    systemctl status chronyd"
+        echo "    journalctl -u chronyd --no-pager -n 30"
+    fi
+
+    echo ""
+    if (( chrony_active )); then
+        success "Chrony 配置完成！系统时间将自动同步。"
+    else
+        warn "Chrony 配置过程有异常，请检查以上错误信息。"
+    fi
+}
+
+timezone_set() {
+    echo ""
+    header "设置时区"
+
+    if ! command -v timedatectl &>/dev/null; then
+        error "未找到 timedatectl，请安装 systemd。"
+        return
+    fi
+
+    timezone_show_status
+
+    # 确认操作（涉及 chrony 安装、停止其他 NTP 服务等）
+    confirm "将强制配置 Chrony 时间同步（会停止其他 NTP 服务），确认？" || return
+
+    echo "  选择时区设置方式:"
+    echo "   1) 从常用时区列表中选择"
+    echo "   2) 搜索时区（输入关键词）"
+    echo "   3) 手动输入时区名称"
+    echo ""
+    echo "   b) 返回"
+    echo "   q) 退出"
+    echo ""
+    read -r -p "  请选择 [1-3]: " method
+
+    local tz=""
+
+    case "$method" in
+        1)
+            echo ""
+            header "选择地区"
+            echo "  1) 亚洲"
+            echo "  2) 欧洲"
+            echo "  3) 北美洲"
+            echo "  4) 南美洲"
+            echo "  5) 大洋洲"
+            echo "  6) 非洲"
+            echo ""
+            read -r -p "  请选择地区 [1-6]: " region
+
+            local region_name=""
+            local tz_list=()
+            case "$region" in
+                1) region_name="亚洲"    ; tz_list=(Asia/Shanghai Asia/Tokyo Asia/Singapore Asia/Dubai Asia/Hong_Kong Asia/Taipei Asia/Seoul Asia/Bangkok Asia/Jakarta Asia/Kolkata Asia/Kuala_Lumpur) ;;
+                2) region_name="欧洲"    ; tz_list=(Europe/London Europe/Paris Europe/Berlin Europe/Moscow Europe/Amsterdam Europe/Madrid Europe/Rome Europe/Stockholm Europe/Zurich Europe/Istanbul Europe/Vienna) ;;
+                3) region_name="北美洲"  ; tz_list=(America/New_York America/Chicago America/Denver America/Los_Angeles America/Toronto America/Vancouver America/Mexico_City America/Phoenix America/Halifax) ;;
+                4) region_name="南美洲"  ; tz_list=(America/Sao_Paulo America/Santiago America/Buenos_Aires America/Bogota America/Lima America/Caracas America/Montevideo) ;;
+                5) region_name="大洋洲"  ; tz_list=(Pacific/Auckland Australia/Sydney Pacific/Fiji Pacific/Honolulu Pacific/Guam Australia/Melbourne) ;;
+                6) region_name="非洲"    ; tz_list=(Africa/Cairo Africa/Johannesburg Africa/Lagos Africa/Nairobi Africa/Casablanca Africa/Accra) ;;
+                *) warn "无效选择"; return ;;
+            esac
+
+            echo ""
+            header "选择时区（${region_name}）"
+            local i
+            for i in "${!tz_list[@]}"; do
+                printf "  %2d) %s\n" $((i+1)) "${tz_list[$i]}"
+            done
+            echo ""
+            read -r -p "  请选择 [1-${#tz_list[@]}]: " tz_idx
+            if [[ "$tz_idx" =~ ^[0-9]+$ ]] && (( tz_idx >= 1 && tz_idx <= ${#tz_list[@]} )); then
+                tz="${tz_list[$((tz_idx-1))]}"
+            else
+                warn "无效选择"; return
+            fi
+            ;;
+        2)
+            read -r -p "  输入关键词 (如 Shanghai, Tokyo, New_York): " keyword
+            [[ -z "$keyword" ]] && { warn "关键词不能为空"; return; }
+            local matches
+            # 使用 -F 做字面匹配，避免用户输入的 [] 等被当作正则
+            matches=$(timedatectl list-timezones 2>/dev/null | grep -i -F "$keyword" || true)
+            if [[ -z "$matches" ]]; then
+                warn "未找到匹配的时区"; return
+            fi
+            local match_list=()
+            while IFS= read -r line; do
+                match_list+=("$line")
+                [[ ${#match_list[@]} -ge 30 ]] && break
+            done <<< "$matches"
+
+            if [[ ${#match_list[@]} -eq 1 ]]; then
+                tz="${match_list[0]}"
+                echo "  匹配: ${tz}"
+            else
+                echo ""
+                header "搜索结果（前 ${#match_list[@]} 条）"
+                local i
+                for i in "${!match_list[@]}"; do
+                    printf "  %2d) %s\n" $((i+1)) "${match_list[$i]}"
+                done
+                echo ""
+                read -r -p "  请选择 [1-${#match_list[@]}]: " sel
+                if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#match_list[@]} )); then
+                    tz="${match_list[$((sel-1))]}"
+                else
+                    warn "无效选择"; return
+                fi
+            fi
+            ;;
+        3)
+            read -r -p "  输入时区名称 (如 Asia/Shanghai): " tz
+            ;;
+        b|B) return ;;
+        q|Q) exit 0 ;;
+        *) warn "无效选项"; return ;;
+    esac
+
+    # 验证时区
+    if [[ -z "$tz" ]]; then
+        warn "时区名称不能为空"; return
+    fi
+    if ! timedatectl list-timezones 2>/dev/null | grep -qxF "$tz"; then
+        warn "无效的时区名称: ${tz}"
+        echo "  提示: 运行 timedatectl list-timezones 查看所有可用时区"
+        return
+    fi
+
+    # 设置时区
+    echo ""
+    info "设置时区: ${tz}"
+    timedatectl set-timezone "$tz" 2>/dev/null || {
+        error "设置时区失败"
+        return
+    }
+    success "时区已设置为 ${tz}"
+
+    # 强制配置 chrony 时间同步
+    echo ""
+    info "正在配置 chrony 时间同步服务..."
+    if ! chrony_force_setup "$tz"; then
+        warn "Chrony 配置过程有异常，请查看以上错误信息。"
+    fi
+
+    echo ""
+    timezone_show_status
+}
+
+chrony_menu() {
+    while true; do
+        clear || true; header "Chrony 时间同步管理"
+
+        echo "  1) 查看 Chrony 运行状态"
+        echo "  2) 强制配置 Chrony（安装/启用/禁用其他 NTP）"
+        echo "  3) 立即同步时间"
+        echo ""
+        echo "  b) 返回上级"
+        echo "  q) 退出脚本"
+        echo ""
+        read -r -p "  请选择: " choice
+        case "$choice" in
+            1)
+                timezone_show_status
+                if command -v chronyc &>/dev/null; then
+                    echo -e "\n  ${BLUE}chronyc tracking:${NC}"
+                    chronyc tracking 2>/dev/null | sed 's/^/    /' || info "chrony 未运行"
+                    echo -e "\n  ${BLUE}chronyc sources -v:${NC}"
+                    chronyc sources -v 2>/dev/null | sed 's/^/    /' || info "chrony 未运行"
+                fi
+                read -r -p "按回车键继续..." ;;
+            2) chrony_force_setup ; read -r -p "按回车键继续..." ;;
+            3)
+                if command -v chronyc &>/dev/null; then
+                    info "正在同步时间..."
+                    # 不使用 -a：无身份验证密钥时也能通过本地 socket 运行
+                    chronyc makestep 2>/dev/null && success "时间已同步" || warn "同步失败，chrony 可能未运行"
+                else
+                    warn "chrony 未安装，请先执行选项 2"
+                fi
+                read -r -p "按回车键继续..." ;;
+            b|B) break ;;
+            q|Q) exit 0 ;;
+            *) warn "无效选项" ; read -r -p "按回车键继续..." ;;
+        esac
+    done
+}
+
 system_menu() {
     while true; do
-        clear; header "系统配置"
-        echo "  1) 设置时区"
+        clear || true; header "系统配置"
+        echo "  1) 设置时区（含强制 Chrony 时间同步）"
         echo "  2) 修改主机名"
         echo "  3) 配置语言环境"
+        echo "  4) Chrony 时间同步管理"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
-            1) placeholder "设置时区" ;;
+            1) timezone_set ;;
             2) placeholder "修改主机名" ;;
             3) placeholder "配置语言环境" ;;
+            4) chrony_menu ;;
             b|B) break ;;
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -478,7 +857,6 @@ system_menu() {
 
 # ---------- SSH 辅助函数 ----------
 
-BACKUP_DIR="/etc/linux-helper/backups"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 LH_SSH_DROPIN="$SSHD_CONFIG_DIR/99-linux-helper.conf"
@@ -570,7 +948,7 @@ ssh_change_port() {
     info "当前 SSH 监听端口: ${current_ports:-未检测到}"
 
     local new_port
-    read -p "输入新的 SSH 端口号 (1-65535): " new_port
+    read -r -p "输入新的 SSH 端口号 (1-65535): " new_port
     if [[ ! "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
         warn "无效端口号，请输入 1-65535 之间的数字。"
         return
@@ -717,7 +1095,7 @@ ssh_root_login() {
 
 ssh_manage_keys() {
     while true; do
-        clear; header "SSH 公钥管理"
+        clear || true; header "SSH 公钥管理"
 
         # 查找所有有 authorized_keys 的用户
         local users=()
@@ -734,7 +1112,7 @@ ssh_manage_keys() {
 
         if [[ ${#users[@]} -eq 0 ]]; then
             info "系统中没有找到 authorized_keys 文件。"
-            read -p "按回车键返回..."
+            read -r -p "按回车键返回..."
             return
         fi
 
@@ -749,7 +1127,7 @@ ssh_manage_keys() {
         echo "  b) 返回上级"
         echo "  q) 退出"
         echo ""
-        read -p "  请选择用户: " user_choice
+        read -r -p "  请选择用户: " user_choice
 
         [[ "$user_choice" =~ ^[Bb]$ ]] && break
         [[ "$user_choice" =~ ^[Qq]$ ]] && exit 0
@@ -766,7 +1144,7 @@ ssh_list_delete_keys() {
     local key_file="$2"
 
     while true; do
-        clear; header "用户 ${user} 的 SSH 公钥"
+        clear || true; header "用户 ${user} 的 SSH 公钥"
 
         local keys=()
         while IFS= read -r line; do
@@ -775,7 +1153,7 @@ ssh_list_delete_keys() {
 
         if [[ ${#keys[@]} -eq 0 ]]; then
             info "该用户没有公钥。"
-            read -p "按回车键返回..."
+            read -r -p "按回车键返回..."
             return
         fi
 
@@ -791,7 +1169,7 @@ ssh_list_delete_keys() {
         echo "  b) 返回上级"
         echo "  q) 退出"
         echo ""
-        read -p "  请选择: " del_choice
+        read -r -p "  请选择: " del_choice
 
         [[ "$del_choice" =~ ^[Bb]$ ]] && return
         [[ "$del_choice" =~ ^[Qq]$ ]] && exit 0
@@ -800,7 +1178,7 @@ ssh_list_delete_keys() {
             confirm "确认删除 ${user} 的所有 ${#keys[@]} 个密钥？" || continue
             : > "$key_file"
             success "已删除 ${user} 的全部密钥"
-            read -p "按回车键继续..."
+            read -r -p "按回车键继续..."
             return
         fi
 
@@ -816,7 +1194,7 @@ ssh_list_delete_keys() {
 
         if [[ ${#to_delete[@]} -eq 0 ]]; then
             warn "无效选择"
-            read -p "按回车键继续..."
+            read -r -p "按回车键继续..."
             continue
         fi
 
@@ -865,13 +1243,13 @@ ssh_list_delete_keys() {
         local remaining
         remaining=$(wc -l < "$key_file")
         info "剩余 ${remaining} 个密钥"
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
 ssh_menu() {
     while true; do
-        clear; header "SSH 安全配置"
+        clear || true; header "SSH 安全配置"
 
         local port display
         port=$(ssh_get_setting "Port")
@@ -890,7 +1268,7 @@ ssh_menu() {
         echo "  b) 返回主菜单"
         echo "  q) 退出脚本"
         echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) ssh_change_port ;;
             2) ssh_root_login ;;
@@ -899,18 +1277,18 @@ ssh_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
 security_menu() {
     while true; do
-        clear; header "系统安全"
+        clear || true; header "系统安全"
         echo "  1) SSH 安全配置"
         echo "  2) 配置防火墙"
         echo "  3) Fail2Ban 管理"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) ssh_menu ;;
             2) placeholder "配置防火墙" ;;
@@ -919,7 +1297,7 @@ security_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -970,21 +1348,21 @@ swap_add() {
     local default_size_mb=$(( mem_total_mb - 1 ))
     (( default_size_mb < 1 )) && default_size_mb=$((mem_total_mb / 2))
 
-    read -p "Swap 文件路径 [${swap_path}]: " input_path
+    read -r -p "Swap 文件路径 [${swap_path}]: " input_path
     [[ -n "$input_path" ]] && swap_path="$input_path"
 
     # 检查是否已存在
     if [[ -f "$swap_path" ]]; then
         if swapon --show | grep -q "$swap_path"; then
             warn "$swap_path 已作为 Swap 在使用"
-            read -p "请先删除现有 Swap 后再添加。按回车键返回..."
+            read -r -p "请先删除现有 Swap 后再添加。按回车键返回..."
             return
         fi
     fi
 
     # 输入大小
     local size_input
-    read -p "Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
+    read -r -p "Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
     size_input="${size_input:-$default_size_mb}"
     if [[ ! "$size_input" =~ ^[0-9]+$ ]] || (( size_input < 1 )); then
         warn "无效大小，请输入正整数（单位 MB）"
@@ -1067,7 +1445,7 @@ swap_delete() {
     # 显示当前 swap
     if ! swapon --show 2>/dev/null | grep -q .; then
         info "没有启用中的 Swap 设备"
-        read -p "按回车键返回..."
+        read -r -p "按回车键返回..."
         return
     fi
 
@@ -1086,7 +1464,7 @@ swap_delete() {
 
     if [[ ${#swap_paths[@]} -eq 0 ]]; then
         info "未检测到 Swap 设备"
-        read -p "按回车键返回..."
+        read -r -p "按回车键返回..."
         return
     fi
 
@@ -1102,7 +1480,7 @@ swap_delete() {
             echo "  $((i+1))) ${swap_paths[$i]}"
         done
         echo ""
-        read -p "请输入编号: " sel
+        read -r -p "请输入编号: " sel
         [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#swap_paths[@]} )) || {
             warn "无效选择"; return
         }
@@ -1153,7 +1531,7 @@ swap_adjust() {
     local default_size_mb=$(( mem_total_mb - 1 ))
     (( default_size_mb < 1 )) && default_size_mb=$((mem_total_mb / 2))
 
-    read -p "Swap 文件路径 [${swap_path}]: " input_path
+    read -r -p "Swap 文件路径 [${swap_path}]: " input_path
     [[ -n "$input_path" ]] && swap_path="$input_path"
 
     echo ""
@@ -1180,7 +1558,7 @@ swap_adjust() {
 
     # 步骤2：添加新的
     local size_input
-    read -p "新的 Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
+    read -r -p "新的 Swap 大小（单位 MB，默认 ${default_size_mb}）: " size_input
     size_input="${size_input:-$default_size_mb}"
     if [[ ! "$size_input" =~ ^[0-9]+$ ]] || (( size_input < 1 )); then
         warn "无效大小，请输入正整数（单位 MB）"
@@ -1250,33 +1628,33 @@ swap_adjust() {
 
 swap_menu() {
     while true; do
-        clear; header "Swap 管理"
+        clear || true; header "Swap 管理"
         echo "  1) 查看 Swap 状态"
         echo "  2) 添加 Swap"
         echo "  3) 删除 Swap"
         echo "  4) 调整 Swap（删除后重建）"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
-            1) swap_show_status ; read -p "按回车键继续..." ;;
+            1) swap_show_status ; read -r -p "按回车键继续..." ;;
             2) swap_add ;;
             3) swap_delete ;;
             4) swap_adjust ;;
             b|B) break ;;
             q|Q) exit 0 ;;
-            *) warn "无效选项" ; read -p "按回车键继续..." ;;
+            *) warn "无效选项" ; read -r -p "按回车键继续..." ;;
         esac
     done
 }
 
 tuning_menu() {
     while true; do
-        clear; header "系统调优"
+        clear || true; header "系统调优"
         echo "  1) Swap 管理"
         echo "  2) 内核参数优化"
         echo "  3) 文件描述符限制"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) swap_menu ;;
             2) placeholder "内核参数优化" ;;
@@ -1285,7 +1663,7 @@ tuning_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -1294,14 +1672,14 @@ tuning_menu() {
 # ============================================================
 info_menu() {
     while true; do
-        clear; header "系统信息"
+        clear || true; header "系统信息"
         echo "  1) 系统概览"
         echo "  2) CPU 信息"
         echo "  3) 内存信息"
         echo "  4) 磁盘信息"
         echo "  5) 网络信息"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) placeholder "系统概览" ;;
             2) placeholder "CPU 信息" ;;
@@ -1312,7 +1690,7 @@ info_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -1321,13 +1699,13 @@ info_menu() {
 # ============================================================
 maintenance_menu() {
     while true; do
-        clear; header "系统维护"
+        clear || true; header "系统维护"
         echo "  1) 系统更新与清理"
         echo "  2) 日志清理"
         echo "  3) Docker 清理"
         echo "  4) 临时文件清理"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) placeholder "系统更新与清理" ;;
             2) placeholder "日志清理" ;;
@@ -1337,7 +1715,7 @@ maintenance_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -1346,13 +1724,13 @@ maintenance_menu() {
 # ============================================================
 tools_menu() {
     while true; do
-        clear; header "工具箱"
+        clear || true; header "工具箱"
         echo "  1) 安装常用软件"
         echo "  2) 安装 Docker"
         echo "  3) 安装 Docker Compose"
         echo "  4) 安装系统监控工具"
         echo ""; echo "  b) 返回主菜单"; echo "  q) 退出脚本"; echo ""
-        read -p "  请选择: " choice
+        read -r -p "  请选择: " choice
         case "$choice" in
             1) placeholder "安装常用软件" ;;
             2) placeholder "安装 Docker" ;;
@@ -1362,7 +1740,7 @@ tools_menu() {
             q|Q) exit 0 ;;
             *) warn "无效选项" ;;
         esac
-        read -p "按回车键继续..."
+        read -r -p "按回车键继续..."
     done
 }
 
@@ -1385,7 +1763,7 @@ menu_main() {
         echo ""
         echo -e "${BLUE}──────────────────────────────────────────────────${NC}"
         echo ""
-        read -p "  请选择 [0-7]: " choice
+        read -r -p "  请选择 [0-7]: " choice
         case "$choice" in
             1) network_menu ;;
             2) system_menu ;;
@@ -1398,7 +1776,7 @@ menu_main() {
                 echo ""; success "感谢使用，再见！"; exit 0 ;;
             *)
                 warn "无效选项，请重新选择。"
-                read -p "按回车键继续..."
+                read -r -p "按回车键继续..."
                 ;;
         esac
     done
