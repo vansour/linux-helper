@@ -19,8 +19,8 @@ type Menu struct {
 
 // Option represents a single menu option.
 type Option struct {
-	Key     string      // "1", "2", "b", "q"
-	Label   string      // display text
+	Key     string // "1", "2", "b", "q"
+	Label   string // display text
 	Handler func() error
 	Submenu *Menu
 	Back    bool // "b" — return to parent
@@ -72,7 +72,7 @@ func (m *Menu) Handle(key string, fn func() error) *Menu {
 func (m *Menu) Run() error {
 	for {
 		shell.Clear()
-		printHeader(m.Title)
+		shell.Header(m.Title)
 
 		for _, opt := range m.Options {
 			if opt.Key == "b" || opt.Key == "B" || opt.Key == "q" || opt.Key == "Q" || opt.Key == "0" {
@@ -141,21 +141,4 @@ func (m *Menu) findOption(key string) *Option {
 		}
 	}
 	return nil
-}
-
-func printHeader(title string) {
-	const width = 50
-	pad := (width - len(title)) / 2
-	if pad < 0 {
-		pad = 0
-	}
-	fmt.Println("")
-	fmt.Println(shell.Cyan(strings.Repeat("=", width)))
-	fmt.Printf("%s%s%s\n",
-		shell.Cyan(strings.Repeat(" ", pad)),
-		shell.Cyan(title),
-		shell.Cyan(strings.Repeat(" ", width-pad-len(title))),
-	)
-	fmt.Println(shell.Cyan(strings.Repeat("=", width)))
-	fmt.Println("")
 }

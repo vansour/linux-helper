@@ -53,15 +53,16 @@ func BackupToDir(dirname string, files map[string]string) (string, error) {
 		if err != nil {
 			continue
 		}
-		defer in.Close()
 
 		dst := filepath.Join(dir, dstName)
 		out, err := os.Create(dst)
 		if err != nil {
+			in.Close()
 			continue
 		}
-		defer out.Close()
 		io.Copy(out, in)
+		in.Close()
+		out.Close()
 	}
 	return dir, nil
 }

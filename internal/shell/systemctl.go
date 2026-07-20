@@ -77,7 +77,7 @@ func (s *SystemdService) Stop() error {
 	if s.Alt != "" {
 		return RunSilent("systemctl", "stop", s.Alt)
 	}
-	return nil
+	return fmt.Errorf("无法停止服务 %s", s.Name)
 }
 
 // Start starts the service.

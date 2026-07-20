@@ -41,7 +41,7 @@ func SysctlPersist(file, key, value string) error {
 			continue
 		}
 		// Remove lines setting the same key
-		if strings.HasPrefix(trimmed, key+"=") {
+		if strings.HasPrefix(trimmed, key+"=") || strings.HasPrefix(trimmed, key+" =") {
 			continue
 		}
 		newLines = append(newLines, line)

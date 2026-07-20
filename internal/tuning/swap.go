@@ -18,7 +18,7 @@ const (
 )
 
 // ShowStatus displays the current system swap state.
-func ShowStatus() {
+func ShowStatus() error {
 	shell.Header("当前 Swap 状态")
 
 	out, err := shell.Run("swapon", "--show")
@@ -30,7 +30,14 @@ func ShowStatus() {
 	}
 
 	fmt.Printf("%s:\n", shell.Blue("free -h"))
-	freeOut, _ := shell.Run("free", "-h"); var memSwapLines []string; for _, l := range strings.Split(freeOut, "\n") { if strings.HasPrefix(l, "Swap") || strings.HasPrefix(l, "Mem") { memSwapLines = append(memSwapLines, l) } }; freeOut = strings.Join(memSwapLines, "\n")
+	freeOut, _ := shell.Run("free", "-h")
+	var memSwapLines []string
+	for _, l := range strings.Split(freeOut, "\n") {
+		if strings.HasPrefix(l, "Swap") || strings.HasPrefix(l, "Mem") {
+			memSwapLines = append(memSwapLines, l)
+		}
+	}
+	freeOut = strings.Join(memSwapLines, "\n")
 	if freeOut != "" {
 		fmt.Println(freeOut)
 	}
@@ -61,10 +68,11 @@ func ShowStatus() {
 		shell.Info("Linux Helper 管理的 Swap 文件: %s", strings.TrimSpace(string(data)))
 	}
 	fmt.Println()
+	return nil
 }
 
 // AddSwap interactively creates a new swap file.
-func AddSwap() {
+func AddSwap() error {
 	shell.Header("添加 Swap")
 
 	swapPath := defaultSwapPath
@@ -79,7 +87,7 @@ func AddSwap() {
 			if s == swapPath {
 				shell.Warn("%s 已作为 Swap 在使用", swapPath)
 				shell.PressEnter()
-				return
+				return nil
 			}
 		}
 	}
@@ -99,7 +107,7 @@ func AddSwap() {
 			sizeMB = s
 		} else {
 			shell.Warn("无效大小，请输入正整数（单位 MB）")
-			return
+			return nil
 		}
 	}
 
@@ -109,7 +117,7 @@ func AddSwap() {
 		if availKB < neededKB {
 			shell.Warn("磁盘空间不足！需要 %dMB，可用约 %dMB", sizeMB, availKB/1024)
 			if !shell.Confirm("仍然继续？") {
-				return
+				return nil
 			}
 		}
 	}
@@ -118,7 +126,15 @@ func AddSwap() {
 	shell.Info("创建 Swap 文件: %s (%dMB)...", swapPath, sizeMB)
 	fmt.Println()
 
-	if shell.Has("fallocate") {
+	fsType := getFSType(filepath.Dir(swapPath))
+	if fsType == "btrfs" {
+		shell.Info("检测到 btrfs 文件系统，创建空文件并禁用 CoW...")
+		if err := shell.RunSilent("truncate", "-s", fmt.Sprintf("%dM", sizeMB), swapPath); err != nil {
+			shell.Info("truncate 失败，使用 dd 创建...")
+			shell.RunSilent("dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapPath), "bs=1M", fmt.Sprintf("count=%d", sizeMB))
+		}
+		shell.RunSilent("chattr", "+C", swapPath)
+	} else if shell.Has("fallocate") {
 		if err := shell.RunSilent("fallocate", "-l", fmt.Sprintf("%dM", sizeMB), swapPath); err != nil {
 			shell.Info("fallocate 失败，使用 dd 创建...")
 			shell.RunSilent("dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapPath), fmt.Sprintf("bs=1M"), fmt.Sprintf("count=%d", sizeMB))
@@ -129,26 +145,20 @@ func AddSwap() {
 
 	if _, err := os.Stat(swapPath); err != nil {
 		shell.Error("创建 Swap 文件失败")
-		return
+		return nil
 	}
 	os.Chmod(swapPath, 0600)
-
-	fsType := getFSType(swapPath)
-	if fsType == "btrfs" {
-		shell.Info("检测到 btrfs 文件系统，禁用 CoW...")
-		shell.RunSilent("chattr", "+C", swapPath)
-	}
 
 	if err := shell.RunSilent("mkswap", swapPath); err != nil {
 		shell.Error("格式化 Swap 失败")
 		os.Remove(swapPath)
-		return
+		return nil
 	}
 
 	if err := shell.RunSilent("swapon", swapPath); err != nil {
 		shell.Error("启用 Swap 失败")
 		os.Remove(swapPath)
-		return
+		return nil
 	}
 
 	ensureFstabEntry(swapPath)
@@ -159,17 +169,18 @@ func AddSwap() {
 	shell.Success("Swap 添加成功！")
 	fmt.Println()
 	ShowStatus()
+	return nil
 }
 
 // DeleteSwap interactively removes a swap device.
-func DeleteSwap() {
+func DeleteSwap() error {
 	shell.Header("删除 Swap")
 
 	swaps := getActiveSwaps()
 	if len(swaps) == 0 {
 		shell.Info("没有启用中的 Swap 设备")
 		shell.PressEnter()
-		return
+		return nil
 	}
 
 	for _, s := range swaps {
@@ -182,7 +193,7 @@ func DeleteSwap() {
 		target = swaps[0]
 		shell.Info("检测到一个 Swap 设备: %s", target)
 		if !shell.Confirm("删除此 Swap？") {
-			return
+			return nil
 		}
 	} else {
 		fmt.Println("选择要删除的 Swap 设备:")
@@ -193,17 +204,17 @@ func DeleteSwap() {
 		sel, err := strconv.Atoi(selStr)
 		if err != nil || sel < 1 || sel > len(swaps) {
 			shell.Warn("无效选择")
-			return
+			return nil
 		}
 		target = swaps[sel-1]
 		if !shell.Confirm(fmt.Sprintf("删除 Swap: %s？", target)) {
-			return
+			return nil
 		}
 	}
 
 	if err := shell.RunSilent("swapoff", target); err != nil {
 		shell.Error("swapoff 失败")
-		return
+		return nil
 	}
 	shell.Success("已停用: %s", target)
 
@@ -220,10 +231,11 @@ func DeleteSwap() {
 
 	fmt.Println()
 	shell.Success("Swap 删除完成")
+	return nil
 }
 
 // AdjustSwap interactively deletes then recreates a swap.
-func AdjustSwap() {
+func AdjustSwap() error {
 	shell.Header("调整 Swap")
 
 	swapPath := defaultSwapPath
@@ -239,7 +251,7 @@ func AdjustSwap() {
 	fmt.Println()
 
 	if !shell.Confirm("确认调整？") {
-		return
+		return nil
 	}
 
 	if _, err := os.Stat(swapPath); err == nil {
@@ -274,7 +286,7 @@ func AdjustSwap() {
 			sizeMB = s
 		} else {
 			shell.Warn("无效大小，请输入正整数（单位 MB）")
-			return
+			return nil
 		}
 	}
 
@@ -284,14 +296,22 @@ func AdjustSwap() {
 		if availKB < neededKB {
 			shell.Warn("磁盘空间不足！需要 %dMB，可用约 %dMB", sizeMB, availKB/1024)
 			if !shell.Confirm("仍然继续？") {
-				return
+				return nil
 			}
 		}
 	}
 
 	fmt.Println()
 	shell.Info("创建新的 Swap 文件: %s (%dMB)", swapPath, sizeMB)
-	if shell.Has("fallocate") {
+	fsType := getFSType(filepath.Dir(swapPath))
+	if fsType == "btrfs" {
+		shell.Info("检测到 btrfs 文件系统，创建空文件并禁用 CoW...")
+		if err := shell.RunSilent("truncate", "-s", fmt.Sprintf("%dM", sizeMB), swapPath); err != nil {
+			shell.Info("truncate 失败，使用 dd 创建...")
+			shell.RunSilent("dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapPath), "bs=1M", fmt.Sprintf("count=%d", sizeMB))
+		}
+		shell.RunSilent("chattr", "+C", swapPath)
+	} else if shell.Has("fallocate") {
 		if err := shell.RunSilent("fallocate", "-l", fmt.Sprintf("%dM", sizeMB), swapPath); err != nil {
 			shell.Info("fallocate 失败，使用 dd 创建...")
 			shell.RunSilent("dd", "if=/dev/zero", fmt.Sprintf("of=%s", swapPath), "bs=1M", fmt.Sprintf("count=%d", sizeMB))
@@ -301,22 +321,16 @@ func AdjustSwap() {
 	}
 	os.Chmod(swapPath, 0600)
 
-	fsType := getFSType(swapPath)
-	if fsType == "btrfs" {
-		shell.Info("检测到 btrfs 文件系统，禁用 CoW...")
-		shell.RunSilent("chattr", "+C", swapPath)
-	}
-
 	if err := shell.RunSilent("mkswap", swapPath); err != nil {
 		shell.Error("格式化 Swap 失败")
 		os.Remove(swapPath)
-		return
+		return nil
 	}
 
 	if err := shell.RunSilent("swapon", swapPath); err != nil {
 		shell.Error("启用 Swap 失败")
 		os.Remove(swapPath)
-		return
+		return nil
 	}
 
 	ensureFstabEntry(swapPath)
@@ -327,6 +341,7 @@ func AdjustSwap() {
 	shell.Success("Swap 调整完成！")
 	fmt.Println()
 	ShowStatus()
+	return nil
 }
 
 // -- unexported helpers --
@@ -427,10 +442,21 @@ func removeFstabEntry(swapPath string) error {
 }
 
 func cleanRecord(target string) {
-	if data, err := os.ReadFile(swapRecordFile); err == nil {
-		if strings.Contains(string(data), target) {
-			os.Remove(swapRecordFile)
+	data, err := os.ReadFile(swapRecordFile)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	var newLines []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != target && line != "" {
+			newLines = append(newLines, line)
 		}
+	}
+	if len(newLines) == 0 {
+		os.Remove(swapRecordFile)
+	} else {
+		os.WriteFile(swapRecordFile, []byte(strings.Join(newLines, "\n")+"\n"), 0644)
 	}
 }
 

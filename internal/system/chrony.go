@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	chronyConfPath     = "/etc/chrony.conf"
-	chronyAltConfPath  = "/etc/chrony/chrony.conf"
-	chronyDriftfile    = "/var/lib/chrony/drift"
-	chronyLogdir       = "/var/log/chrony"
+	chronyConfPath    = "/etc/chrony.conf"
+	chronyAltConfPath = "/etc/chrony/chrony.conf"
+	chronyDriftfile   = "/var/lib/chrony/drift"
+	chronyLogdir      = "/var/log/chrony"
 )
 
 // ChronyShowConfig displays chrony status, tracking, and source information.

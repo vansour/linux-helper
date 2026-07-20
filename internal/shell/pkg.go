@@ -45,7 +45,8 @@ func InstallPackage(pkg string) error {
 	}
 
 	if pm.Name == "apt" {
-		cmd := exec.Command(pm.InstallArgs[1], pm.InstallArgs[2:]...)
+		args := append(pm.InstallArgs[2:], pkg)
+		cmd := exec.Command(pm.InstallArgs[1], args...)
 		cmd.Env = append(cmd.Environ(), pm.InstallArgs[0])
 		out, err := cmd.CombinedOutput()
 		if err != nil {

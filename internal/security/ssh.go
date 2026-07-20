@@ -61,7 +61,7 @@ func ChangePort() error {
 		}
 	}
 
-	backupSSHConfig()
+	backupDir := backupSSHConfig()
 
 	// Clean Port lines from all files
 	shell.Info("清除所有文件中的 Port 配置...")
@@ -76,8 +76,8 @@ func ChangePort() error {
 
 	fmt.Println("")
 	if _, err := shell.Run("sshd", "-t"); err != nil {
-		shell.Error("配置语法错误！恢复备份...")
-		// Restore handled by backup
+		shell.Error("配置语法错误！正在恢复备份...")
+		restoreSSHConfig(backupDir)
 		return nil
 	}
 	shell.Success("配置语法正确")
@@ -127,7 +127,7 @@ func EnableRootLogin() error {
 		return nil
 	}
 
-	backupSSHConfig()
+	backupDir := backupSSHConfig()
 
 	// Clean settings from all files
 	for _, key := range []string{"PermitRootLogin", "PasswordAuthentication", "ChallengeResponseAuthentication"} {
@@ -146,6 +146,7 @@ func EnableRootLogin() error {
 	fmt.Println("")
 	if _, err := shell.Run("sshd", "-t"); err != nil {
 		shell.Error("配置语法错误，请手动检查 /etc/ssh/sshd_config")
+		restoreSSHConfig(backupDir)
 		return nil
 	}
 	shell.Success("配置语法正确")
@@ -268,7 +269,7 @@ func getSSHSetting(key string) string {
 	data, _ := os.ReadFile(sshdConfig)
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, key) {
+		if matchSSHSetting(trimmed, key) {
 			parts := strings.Fields(trimmed)
 			if len(parts) >= 2 {
 				val = parts[1]
@@ -285,7 +286,7 @@ func getSSHSetting(key string) string {
 			data, _ := os.ReadFile(filepath.Join(sshdConfigDir, e.Name()))
 			for _, line := range strings.Split(string(data), "\n") {
 				trimmed := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmed, key) {
+				if matchSSHSetting(trimmed, key) {
 					parts := strings.Fields(trimmed)
 					if len(parts) >= 2 {
 						val = parts[1]
@@ -310,7 +311,7 @@ func cleanSettingFromSSH(key string) {
 		data, _ := os.ReadFile(fp)
 		var lines []string
 		for _, line := range strings.Split(string(data), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), key) {
+			if !matchSSHSetting(strings.TrimSpace(line), key) {
 				lines = append(lines, line)
 			}
 		}
@@ -323,7 +324,7 @@ func cleanSettingFromSSH(key string) {
 	}
 }
 
-func backupSSHConfig() {
+func backupSSHConfig() string {
 	os.MkdirAll(backupDirPrefix, 0755)
 	ts := shell.Timestamp()
 	dir := filepath.Join(backupDirPrefix, "ssh-backup-"+ts)
@@ -333,13 +334,31 @@ func backupSSHConfig() {
 	os.WriteFile(filepath.Join(dir, "sshd_config"), data, 0644)
 
 	if entries, err := os.ReadDir(sshdConfigDir); err == nil {
-		os.MkdirAll(filepath.Join(dir, "sshd_config.d"), 0755)
+		dropinDir := filepath.Join(dir, "sshd_config.d")
+		os.MkdirAll(dropinDir, 0755)
 		for _, e := range entries {
 			data, _ := os.ReadFile(filepath.Join(sshdConfigDir, e.Name()))
-			os.WriteFile(filepath.Join(dir, "sshd_config.d", e.Name()), data, 0644)
+			os.WriteFile(filepath.Join(dropinDir, e.Name()), data, 0644)
 		}
 	}
 	shell.Info("SSH 配置已备份到: %s", dir)
+	return dir
+}
+
+func restoreSSHConfig(backupDir string) {
+	shell.Info("从备份恢复 SSH 配置: %s", backupDir)
+	src := filepath.Join(backupDir, "sshd_config")
+	if data, err := os.ReadFile(src); err == nil {
+		os.WriteFile(sshdConfig, data, 0644)
+	}
+	dropinDir := filepath.Join(backupDir, "sshd_config.d")
+	if entries, err := os.ReadDir(dropinDir); err == nil {
+		for _, e := range entries {
+			data, _ := os.ReadFile(filepath.Join(dropinDir, e.Name()))
+			os.WriteFile(filepath.Join(sshdConfigDir, e.Name()), data, 0644)
+		}
+	}
+	shell.Success("SSH 配置已恢复")
 }
 
 func defaultIfEmpty(val, def string) string {
@@ -442,4 +461,18 @@ func listDeleteKeys(user, keyFile string) {
 		shell.Info("剩余 %d 个密钥", len(newKeys))
 		shell.PressEnter()
 	}
+}
+
+// matchSSHSetting checks if trimmed line starts with the given SSH config key,
+// using word boundary matching to avoid false matches (e.g. "Port" != "PortForwarding").
+func matchSSHSetting(trimmed, key string) bool {
+	if !strings.HasPrefix(trimmed, key) {
+		return false
+	}
+	// After the key, the next char must be space, tab, or end of string
+	if len(trimmed) == len(key) {
+		return true
+	}
+	next := trimmed[len(key)]
+	return next == ' ' || next == '\t' || next == '='
 }

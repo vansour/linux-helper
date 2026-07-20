@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/vansour/linux-helper/internal/shell"
@@ -11,14 +12,21 @@ import (
 
 const hostsFile = "/etc/hosts"
 
-// Known IPv6 address prefixes for /etc/hosts matching.
-var ipv6Prefixes = []string{"::1", "ff02::", "fe80::", "2001:", "2002:", "3ffe:"}
-
-// isIPv6Addr checks if a trimmed hosts line starts with a known IPv6 address.
+// isIPv6Addr checks if a trimmed hosts line starts with an IPv6 address.
+// Matches standard IPv6 address prefixes: 2000::/3, fc00::/7, fe80::/10, ff00::/8, ::1, etc.
 func isIPv6Addr(s string) bool {
-	for _, p := range ipv6Prefixes {
-		if strings.HasPrefix(s, p) {
-			return true
+	// ::1 loopback
+	if strings.HasPrefix(s, "::") {
+		return true
+	}
+	// Any hex-prefixed IPv6 address: ends with ":" or continues with hex digits + ":"
+	if len(s) >= 3 && s[0] >= '0' && s[0] <= '9' {
+		return strings.Contains(s, ":")
+	}
+	if len(s) >= 2 {
+		c := s[0]
+		if (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			return strings.Contains(s, ":")
 		}
 	}
 	return false
@@ -37,10 +45,11 @@ func ShowIPv6Status() error {
 
 	fmt.Println("")
 	fmt.Println("  GRUB 参数:")
-	grubParams, _ := shell.Run("grep", "ipv6.disable", "/etc/default/grub")
-	if strings.Contains(grubParams, "ipv6.disable=1") {
+	grubData, _ := os.ReadFile("/etc/default/grub")
+	grubContent := string(grubData)
+	if strings.Contains(grubContent, "ipv6.disable=1") {
 		fmt.Printf("    %s (在 GRUB 中禁用)\n", shell.Yellow("ipv6.disable=1"))
-	} else if strings.Contains(grubParams, "ipv6.disable=0") {
+	} else if strings.Contains(grubContent, "ipv6.disable=0") {
 		fmt.Printf("    %s (在 GRUB 中启用)\n", shell.Green("ipv6.disable=0"))
 	} else {
 		fmt.Printf("    %s\n", shell.Blue("未设置"))
@@ -48,15 +57,16 @@ func ShowIPv6Status() error {
 
 	fmt.Println("")
 	fmt.Println("  sysctl 配置:")
-	files, _ := shell.Run("grep", "-rl", "disable_ipv6", "/etc/sysctl.d/", "/etc/sysctl.conf")
-	for _, f := range strings.Split(strings.TrimSpace(files), "\n") {
-		if f == "" {
-			continue
+	sysctlFiles := findSysctlFilesWithKey("disable_ipv6")
+	for _, f := range sysctlFiles {
+		data, _ := os.ReadFile(f)
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.Contains(line, "disable_ipv6") {
+				fmt.Printf("    %s: %s\n", f, shell.Yellow(strings.TrimSpace(line)))
+			}
 		}
-		line, _ := shell.Run("grep", "disable_ipv6", f)
-		fmt.Printf("    %s: %s\n", f, shell.Yellow(line))
 	}
-	if strings.TrimSpace(files) == "" {
+	if len(sysctlFiles) == 0 {
 		fmt.Println("    (无)")
 	}
 
@@ -67,9 +77,10 @@ func ShowIPv6Status() error {
 	found := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(strings.TrimSpace(line), "::") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && isIPv6Addr(trimmed) {
 			found = true
-			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			if strings.HasPrefix(trimmed, "#") {
 				fmt.Printf("    %s %s\n", shell.Yellow("(已注释)"), line)
 			} else {
 				fmt.Printf("    %s %s\n", shell.Green(""), line)
@@ -138,13 +149,9 @@ func DisableIPv6() error {
 	shell.Info("配置 sysctl 禁用 IPv6...")
 	os.MkdirAll("/etc/sysctl.d", 0755)
 
-	sysctlFiles, _ := shell.Run("grep", "-rl", "disable_ipv6", "/etc/sysctl.d/", "/etc/sysctl.conf")
-	for _, f := range strings.Split(strings.TrimSpace(sysctlFiles), "\n") {
-		if f == "" {
-			continue
-		}
-		shell.Run("cp", f, backupDir+"/")
+	for _, f := range findSysctlFilesWithKey("disable_ipv6") {
 		data, _ := os.ReadFile(f)
+		os.WriteFile(filepath.Join(backupDir, filepath.Base(f)), data, 0644)
 		var filtered []string
 		for _, line := range strings.Split(string(data), "\n") {
 			if !strings.Contains(line, "disable_ipv6") {
@@ -256,11 +263,7 @@ func EnableIPv6() error {
 
 	// 2. sysctl enable IPv6
 	shell.Info("配置 sysctl 启用 IPv6...")
-	sysctlFiles, _ := shell.Run("grep", "-rl", "disable_ipv6", "/etc/sysctl.d/", "/etc/sysctl.conf")
-	for _, f := range strings.Split(strings.TrimSpace(sysctlFiles), "\n") {
-		if f == "" {
-			continue
-		}
+	for _, f := range findSysctlFilesWithKey("disable_ipv6") {
 		data, _ := os.ReadFile(f)
 		var filtered []string
 		for _, line := range strings.Split(string(data), "\n") {
@@ -323,4 +326,22 @@ func EnableIPv6() error {
 	fmt.Println("")
 	ShowIPv6Status()
 	return nil
+}
+
+// findSysctlFilesWithKey returns sysctl.d files and /etc/sysctl.conf that contain the given key.
+func findSysctlFilesWithKey(key string) []string {
+	var result []string
+	candidates := []string{"/etc/sysctl.conf"}
+	globFiles, _ := filepath.Glob("/etc/sysctl.d/*.conf")
+	candidates = append(candidates, globFiles...)
+	for _, f := range candidates {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), key) {
+			result = append(result, f)
+		}
+	}
+	return result
 }

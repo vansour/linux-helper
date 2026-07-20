@@ -17,9 +17,13 @@ echo "  正在获取最新版本..."
 VERSION=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
   | grep '"tag_name"' | cut -d'"' -f4 2>/dev/null || echo "")
 if [[ -z "$VERSION" ]]; then
-  VERSION="latest"
+  echo "  - 无法获取最新版本，将尝试从 main 分支下载..."
+  echo ""
+  echo "注意：直接使用 main 分支二进制可能不是最新稳定版。"
+  echo "建议在 https://github.com/$REPO/releases 查看 latest release。"
+  echo ""
 fi
-echo "  版本: $VERSION"
+echo "  版本: ${VERSION:-main}"
 
 # Detect architecture
 ARCH="$(uname -m)"
@@ -34,11 +38,20 @@ case "$ARCH" in
 esac
 echo "  架构: $ARCH"
 
-# Download
-URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY-linux-$ARCH"
-echo "  下载: $URL"
+# Download (fall back to raw github content for latest if version is empty)
+if [[ -z "$VERSION" ]]; then
+  URL="https://github.com/$REPO/releases/download/v0.0.1/$BINARY-linux-$ARCH"
+  echo "  下载稳定版: $URL"
+else
+  URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY-linux-$ARCH"
+  echo "  下载: $URL"
+fi
 echo ""
-curl -sSL "$URL" -o "$BINDIR/$BINARY"
+if ! curl -sSL "$URL" -o "$BINDIR/$BINARY"; then
+  echo "  - 下载失败，尝试备用方式..."
+  echo "  - 请手动下载: $URL"
+  exit 1
+fi
 chmod +x "$BINDIR/$BINARY"
 
 echo ""

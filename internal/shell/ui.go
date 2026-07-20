@@ -43,29 +43,33 @@ func Error(format string, args ...interface{}) {
 	fmt.Printf("%s[ERROR]%s %s\n", colorRed, ColorNC, fmt.Sprintf(format, args...))
 }
 
+func colorize(code, text string) string {
+	return code + text + ColorNC
+}
+
 // Cyan wraps text in cyan color.
 func Cyan(text string) string {
-	return colorCyan + text + ColorNC
+	return colorize(colorCyan, text)
 }
 
 // Green wraps text in green color.
 func Green(text string) string {
-	return colorGreen + text + ColorNC
+	return colorize(colorGreen, text)
 }
 
 // Red wraps text in red color.
 func Red(text string) string {
-	return colorRed + text + ColorNC
+	return colorize(colorRed, text)
 }
 
 // Blue wraps text in blue color.
 func Blue(text string) string {
-	return colorBlue + text + ColorNC
+	return colorize(colorBlue, text)
 }
 
 // Yellow wraps text in yellow color.
 func Yellow(text string) string {
-	return colorYellow + text + ColorNC
+	return colorize(colorYellow, text)
 }
 
 // Header prints a centered section header.
