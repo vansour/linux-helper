@@ -30,7 +30,7 @@ func ShowStatus() {
 	}
 
 	fmt.Printf("%s:\n", shell.Blue("free -h"))
-	freeOut, _ := shell.Run("sh", "-c", "free -h | grep -E '^Swap|^Mem'")
+	freeOut, _ := shell.Run("free", "-h"); var memSwapLines []string; for _, l := range strings.Split(freeOut, "\n") { if strings.HasPrefix(l, "Swap") || strings.HasPrefix(l, "Mem") { memSwapLines = append(memSwapLines, l) } }; freeOut = strings.Join(memSwapLines, "\n")
 	if freeOut != "" {
 		fmt.Println(freeOut)
 	}

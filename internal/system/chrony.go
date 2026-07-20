@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/vansour/linux-helper/internal/shell"
 )
@@ -92,12 +93,6 @@ func SetupChrony(userTz string) error {
 			svc.Disable()
 		}
 	}
-	// Also try to stop/disable using Disable() which calls disable --now
-	for _, svc := range conflictingServices {
-		if svc.IsEnabled() || svc.IsActive() {
-			_ = svc.Disable()
-		}
-	}
 
 	shell.RunSilent("timedatectl", "set-ntp", "false")
 
@@ -148,7 +143,8 @@ func SetupChrony(userTz string) error {
 		shell.Warn("chrony 服务启动失败，请手动检查: systemctl status chronyd")
 	}
 
-	// 8. Immediately step time (no -a flag for local socket)
+	// 8. Wait for chronyd socket to be ready, then sync time
+	time.Sleep(1 * time.Second)
 	shell.RunSilent("chronyc", "makestep")
 
 	// 9. Show status

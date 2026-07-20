@@ -87,8 +87,8 @@ func EnableBBR() error {
 	shell.Header("验证结果")
 	currentCC, _ := shell.Run("sysctl", "-n", "net.ipv4.tcp_congestion_control")
 	currentQdisc, _ := shell.Run("sysctl", "-n", "net.core.default_qdisc")
-	fmt.Printf("  TCP 拥塞控制算法: %s%s%s\n", shell.Green(strings.TrimSpace(currentCC)), "", shell.ColorNC)
-	fmt.Printf("  默认队列规则:     %s%s%s\n", shell.Green(strings.TrimSpace(currentQdisc)), "", shell.ColorNC)
+	fmt.Printf("  TCP 拥塞控制算法: %s\n", shell.Green(strings.TrimSpace(currentCC)))
+	fmt.Printf("  默认队列规则:     %s\n", shell.Green(strings.TrimSpace(currentQdisc)))
 
 	if strings.TrimSpace(currentCC) == "bbr" {
 		shell.Success("BBR 已启用 ✓")

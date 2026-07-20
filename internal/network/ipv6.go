@@ -11,6 +11,19 @@ import (
 
 const hostsFile = "/etc/hosts"
 
+// Known IPv6 address prefixes for /etc/hosts matching.
+var ipv6Prefixes = []string{"::1", "ff02::", "fe80::", "2001:", "2002:", "3ffe:"}
+
+// isIPv6Addr checks if a trimmed hosts line starts with a known IPv6 address.
+func isIPv6Addr(s string) bool {
+	for _, p := range ipv6Prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // ShowIPv6Status displays current IPv6 configuration.
 func ShowIPv6Status() error {
 	shell.Header("当前 IPv6 状态")
@@ -112,11 +125,7 @@ func DisableIPv6() error {
 	var newLines []string
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "::1") || strings.HasPrefix(trimmed, "ff02::") {
-			newLines = append(newLines, "#"+line)
-		} else if len(trimmed) >= 4 && strings.Contains(trimmed, ":") &&
-			(trimmed[0] >= 'a' && trimmed[0] <= 'f' || trimmed[0] >= '0' && trimmed[0] <= '9') {
-			// Also comment other IPv6 address lines
+		if isIPv6Addr(trimmed) {
 			newLines = append(newLines, "#"+line)
 		} else {
 			newLines = append(newLines, line)
@@ -129,7 +138,6 @@ func DisableIPv6() error {
 	shell.Info("配置 sysctl 禁用 IPv6...")
 	os.MkdirAll("/etc/sysctl.d", 0755)
 
-	// Clean disable_ipv6 from all sysctl files
 	sysctlFiles, _ := shell.Run("grep", "-rl", "disable_ipv6", "/etc/sysctl.d/", "/etc/sysctl.conf")
 	for _, f := range strings.Split(strings.TrimSpace(sysctlFiles), "\n") {
 		if f == "" {
@@ -146,7 +154,6 @@ func DisableIPv6() error {
 		os.WriteFile(f, []byte(strings.Join(filtered, "\n")), 0644)
 	}
 
-	// Write unified disable config
 	shell.SysctlPersist("/etc/sysctl.d/99-lh-disable-ipv6.conf",
 		"net.ipv6.conf.all.disable_ipv6", "1")
 	shell.SysctlPersist("/etc/sysctl.d/99-lh-disable-ipv6.conf",
@@ -174,7 +181,6 @@ func DisableIPv6() error {
 	}
 	os.WriteFile(sshdConfig, []byte(strings.Join(sshdLines, "\n")), 0644)
 
-	// Also clean drop-in AddressFamily
 	dropDir := "/etc/ssh/sshd_config.d"
 	if entries, err := os.ReadDir(dropDir); err == nil {
 		for _, e := range entries {
@@ -190,7 +196,6 @@ func DisableIPv6() error {
 		}
 	}
 
-	// Restart SSH
 	if _, err := shell.Run("sshd", "-t"); err == nil {
 		shell.RunSilent("systemctl", "restart", "sshd")
 	} else {
@@ -230,10 +235,11 @@ func EnableIPv6() error {
 	hasIpv6 := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#::1") || strings.HasPrefix(trimmed, "#ff02::") {
+		// Uncomment lines that were commented by DisableIPv6
+		if strings.HasPrefix(trimmed, "#") && isIPv6Addr(strings.TrimSpace(trimmed[1:])) {
 			newLines = append(newLines, trimmed[1:])
 			hasIpv6 = true
-		} else if strings.HasPrefix(trimmed, "::1") || strings.HasPrefix(trimmed, "ff02::") {
+		} else if isIPv6Addr(trimmed) {
 			newLines = append(newLines, line)
 			hasIpv6 = true
 		} else {

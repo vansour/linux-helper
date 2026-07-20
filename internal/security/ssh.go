@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -50,9 +51,10 @@ func ChangePort() error {
 		return nil
 	}
 
-	// Check if port is in use
+	// Check if port is in use using word boundary
 	out, _ := shell.Run("ss", "-tlnp")
-	if strings.Contains(out, ":"+portStr+" ") {
+	portRe := regexp.MustCompile(fmt.Sprintf(":%d\\b", newPort))
+	if portRe.MatchString(out) {
 		shell.Warn("端口 %d 已被占用", newPort)
 		if !shell.Confirm("仍然强制设置？") {
 			return nil

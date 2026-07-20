@@ -42,11 +42,6 @@ func InstallDocker() {
 	}
 
 	shell.Info("正在使用官方脚本安装 Docker...")
-	if _, err := shell.Run("curl", "-fsSL", "https://get.docker.com"); err != nil {
-		shell.Error("下载 Docker 安装脚本失败: %v", err)
-		fmt.Println("")
-		return
-	}
 	shell.RunSilent("sh", "-c", "curl -fsSL https://get.docker.com | sh")
 
 	if shell.Has("docker") {

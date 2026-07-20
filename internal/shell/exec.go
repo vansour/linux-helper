@@ -2,7 +2,6 @@
 package shell
 
 import (
-	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -38,11 +37,3 @@ func Has(bin string) bool {
 	return err == nil
 }
 
-// MustRun runs a command or panics with context.
-func MustRun(name string, args ...string) string {
-	out, err := Run(name, args...)
-	if err != nil {
-		panic(fmt.Sprintf("%s %s: %v — %s", name, strings.Join(args, " "), err, out))
-	}
-	return out
-}
